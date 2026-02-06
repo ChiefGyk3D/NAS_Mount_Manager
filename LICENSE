@@ -1,0 +1,79 @@
+# Mozilla Public License Version 2.0
+
+1. Definitions
+
+1.1. "Contributor" means each individual or legal entity that creates, contributes to, or owns Covered Software.
+
+1.2. "Contributor Version" means the combination of Covered Software and Modifications made by that Contributor.
+
+1.3. "Covered Software" means Source Code Form to which the initial Contributor has attached the notice in Exhibit A, and which is governed by the terms of this License.
+
+1.4. "Incompatible With Secondary Licenses" means
+    (a) that the initial Contributor has attached the notice described in Exhibit B to the Covered Software; or
+    (b) that the Covered Software was made available under the terms of this License, but not also under the terms of a Secondary License.
+
+1.5. "Modifications" means any of the following:
+    (a) Any file in Source Code Form that is added to Covered Software by an individual or legal entity.
+    (b) Any new file in Source Code Form that contains any part of Covered Software.
+    (c) Any change to Covered Software that is not a new file.
+
+1.6. "Patent Claims" means any patent claim(s), including without limitation, method, process, and apparatus claims, in any patent licensable by a Contributor.
+
+1.7. "Secondary License" means any of the following:
+    (a) the GNU General Public License, Version 2.0 or later;
+    (b) the GNU Lesser General Public License, Version 2.1 or later;
+    (c) the GNU Affero General Public License, Version 3.0 or later;
+    (d) the Eclipse Public License, Version 1.0 or later;
+    (e) the Common Public License, Version 1.0 or later.
+
+1.8. "Source Code Form" means the form of the Covered Software preferred for making modifications.
+
+1.9. "You" (or "Your") means an individual or legal entity exercising rights under this License.
+
+1. License Grants
+
+1.1. Grants
+    Each Contributor grants You a world-wide, royalty-free, non-exclusive license:
+    (a) under intellectual property rights (other than patent or trademark) to use, reproduce, make available, modify, display, perform, distribute, and otherwise exploit its Contributor Version, in Source Code Form and Executable Form, within the scope of this License;
+    (b) under patent rights, to make, have made, use, offer to sell, sell, import, and otherwise transfer its Contributor Version.
+
+1.2. Effective Date
+    The rights granted under this License are effective on the date the initial Contributor first distributes Covered Software under the terms of this License.
+
+1.3. Limitations
+    No trademark rights are granted under this License.
+    You may not use any Contributor's name, logo, or trademarks without their permission.
+
+1. Responsibilities
+
+1.1. Distribution
+    If You distribute Covered Software in Source Code Form, You must:
+    (a) attach the notice in Exhibit A to each file;
+    (b) include a copy of this License;
+    (c) inform recipients how they can obtain a copy of this License.
+
+1.2. Modifications
+    If You make Modifications, You must:
+    (a) attach the notice in Exhibit A to each file;
+    (b) include a statement of changes.
+
+1. Disclaimer of Warranty
+    Covered Software is provided "AS IS" without warranty of any kind.
+
+2. Limitation of Liability
+    Contributors are not liable for any damages arising from the use of Covered Software.
+
+3. Termination
+    This License terminates if You fail to comply with its terms.
+
+4. Miscellaneous
+    This License is governed by the laws of the jurisdiction where the initial Contributor is located.
+
+---
+
+## Exhibit A - Mozilla Public License Version 2.0
+
+If it is not already present, please include the following notice in each file:
+
+    This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
