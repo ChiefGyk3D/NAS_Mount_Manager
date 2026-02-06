@@ -117,8 +117,9 @@ The tool will:
 
 When you run `./mount-nas.sh mount`, shares that are already managed by fstab are
 **automatically skipped** with a helpful message pointing you to use `cd` or `sudo mount`
-for those shares instead. This prevents conflicts between manual mounts and systemd automounts.
+Mozilla Public License Version 2.0 (MPL 2.0)
 
+This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 ### Fstab Status
 
 `./mount-nas.sh status` shows both active mounts and existing fstab entries for your NAS,
