@@ -216,4 +216,4 @@ sudo apt install libsecret-tools
 
 ## License
 
-MIT
+Mozilla Public License 2.0
