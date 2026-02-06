@@ -1,0 +1,21 @@
+# NAS Mount Manager - Git Ignore
+
+# Config file (may contain credentials)
+nas.conf
+*.conf
+
+# Credential files
+.credentials
+*.creds
+
+# Editor / OS files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
