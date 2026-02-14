@@ -116,10 +116,8 @@ The tool will:
 ### Fstab-Aware Mounting
 
 When you run `./mount-nas.sh mount`, shares that are already managed by fstab are
-**automatically skipped** with a helpful message pointing you to use `cd` or `sudo mount`
-Mozilla Public License Version 2.0 (MPL 2.0)
+**automatically skipped** with a helpful message pointing you to use `cd` or `sudo mount`.
 
-This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 ### Fstab Status
 
 `./mount-nas.sh status` shows both active mounts and existing fstab entries for your NAS,
@@ -216,4 +214,6 @@ sudo apt install libsecret-tools
 
 ## License
 
-Mozilla Public License 2.0
+Mozilla Public License Version 2.0 (MPL 2.0)
+
+This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
