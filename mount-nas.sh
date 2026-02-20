@@ -19,6 +19,7 @@ SHARES="${NAS_SHARES:-}"
 SMB_VERSION="${NAS_SMB_VERSION:-3.0}"
 MOUNT_OPTS="${NAS_MOUNT_OPTS:-iocharset=utf8,file_mode=0775,dir_mode=0775,nofail}"
 TIMEOUT=${NAS_TIMEOUT:-30}
+EXCLUDE_SHARES="${NAS_EXCLUDE_SHARES:-}"
 
 # Load config file if it exists
 if [ -f "$CONFIG_FILE" ]; then
@@ -34,7 +35,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 DISCOVERED_SHARES=""
 DRY_RUN=false
 NO_COLOR=${NO_COLOR:-false}
@@ -91,6 +92,7 @@ usage() {
     echo ""
     echo "Commands:"
     echo "  mount,    m       Mount NAS shares"
+    echo "  remount,  r       Unmount and re-mount all NAS shares"
     echo "  unmount,  u       Unmount all NAS shares"
     echo "  status,   s       Show current mount status"
     echo "  discover, d       Discover available SMB shares"
@@ -104,6 +106,7 @@ usage() {
     echo "  -p, --pass PASS   SMB password"
     echo "  -m, --mount PATH  Mount base path (default: $MOUNT_BASE)"
     echo "  -s, --shares LIST Comma-separated share names"
+    echo "  -e, --exclude LIST Comma-separated shares to skip (e.g. homes,photo)"
     echo "  -t, --timeout SEC Connection timeout in seconds (default: $TIMEOUT)"
     echo "  --smb-version VER SMB protocol version (default: $SMB_VERSION)"
     echo "  --dry-run         Show what would be done without doing it"
@@ -113,7 +116,8 @@ usage() {
     echo ""
     echo "Environment Variables:"
     echo "  NAS_IP, NAS_USER, NAS_PASS, NAS_MOUNT_BASE, NAS_SHARES,"
-    echo "  NAS_SMB_VERSION, NAS_MOUNT_OPTS, NAS_CONFIG, NAS_TIMEOUT, NO_COLOR"
+    echo "  NAS_SMB_VERSION, NAS_MOUNT_OPTS, NAS_CONFIG, NAS_TIMEOUT,"
+    echo "  NAS_EXCLUDE_SHARES, NO_COLOR"
     echo ""
     echo "Config File: $CONFIG_FILE"
     echo ""
@@ -122,6 +126,7 @@ usage() {
     echo "  $(basename "$0") -i 10.0.0.5 discover            # Discover shares on different NAS"
     echo "  $(basename "$0") -i 10.0.0.5 -u admin mount      # Mount with specific IP and user"
     echo "  $(basename "$0") -s media,backups mount           # Mount specific shares only"
+    echo "  $(basename "$0") -e homes,photo mount             # Mount all except excluded shares"
     echo "  $(basename "$0") fstab                            # Generate fstab entries"
 }
 
@@ -155,25 +160,43 @@ check_nas() {
 
 # Check if system keyring is available (GNOME Keyring / KDE Wallet)
 has_keyring() {
-    command -v secret-tool &>/dev/null
+    # Need secret-tool binary
+    command -v secret-tool &>/dev/null || return 1
+    # Need a D-Bus session bus (required for secret-tool to talk to keyring)
+    [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || return 1
+    # Quick check: can we reach the secrets service at all?
+    secret-tool lookup service nas-mount-test key ping 2>/dev/null
+    # lookup returns 1 when key not found (which is fine — service is reachable)
+    # but returns other codes or hangs when service is unavailable
+    return 0
 }
 
 # Store password in system keyring
 keyring_store() {
     local ip="$1" user="$2" pass="$3"
-    if has_keyring; then
-        echo "$pass" | secret-tool store --label="NAS $ip ($user)" \
-            nas-mount host "$ip" user "$user" 2>/dev/null
-        return $?
+    if ! command -v secret-tool &>/dev/null; then
+        echo -e "${YELLOW}  secret-tool not installed. Install with: sudo apt install libsecret-tools${NC}" >&2
+        return 1
     fi
-    return 1
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        echo -e "${YELLOW}  No D-Bus session bus — keyring requires a desktop session.${NC}" >&2
+        echo -e "${YELLOW}  If using SSH/TTY, start one with: eval \$(dbus-launch --sh-syntax)${NC}" >&2
+        return 1
+    fi
+    echo "$pass" | timeout 5 secret-tool store --label="NAS $ip ($user)" \
+        service nas-mount host "$ip" user "$user" 2>/dev/null
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        echo -e "${YELLOW}  Keyring daemon may not be running. Try: gnome-keyring-daemon --start --components=secrets${NC}" >&2
+    fi
+    return $rc
 }
 
 # Retrieve password from system keyring
 keyring_lookup() {
     local ip="$1" user="$2"
     if has_keyring; then
-        secret-tool lookup nas-mount host "$ip" user "$user" 2>/dev/null
+        secret-tool lookup service nas-mount host "$ip" user "$user" 2>/dev/null
         return $?
     fi
     return 1
@@ -183,7 +206,7 @@ keyring_lookup() {
 keyring_clear() {
     local ip="$1" user="$2"
     if has_keyring; then
-        secret-tool clear nas-mount host "$ip" user "$user" 2>/dev/null
+        secret-tool clear service nas-mount host "$ip" user "$user" 2>/dev/null
         return $?
     fi
     return 1
@@ -220,9 +243,8 @@ get_credentials() {
             if [[ "$save_kr" =~ ^[Yy] ]]; then
                 if keyring_store "$NAS_IP" "$NAS_USER" "$NAS_PASS"; then
                     echo -e "${GREEN}✓ Password saved to keyring${NC}"
-                else
-                    echo -e "${YELLOW}⚠ Could not save to keyring${NC}"
                 fi
+                # keyring_store already prints diagnostic messages on failure
             fi
         fi
     fi
@@ -252,7 +274,10 @@ build_cred_opts() {
     else
         opts="guest"
     fi
-    opts="$opts,vers=$SMB_VERSION,$MOUNT_OPTS"
+    # Map ownership to the invoking user (SUDO_UID/GID if run via sudo, else current user)
+    local mount_uid=${SUDO_UID:-$(id -u)}
+    local mount_gid=${SUDO_GID:-$(id -g)}
+    opts="$opts,uid=$mount_uid,gid=$mount_gid,vers=$SMB_VERSION,$MOUNT_OPTS"
     echo "$opts"
 }
 
@@ -269,6 +294,32 @@ trap cleanup_credentials EXIT INT TERM
 TEMP_CRED_FILE=""
 
 # ── Commands ─────────────────────────────────────────────────────────────────
+
+# Check if a share name is in the exclusion list
+is_excluded() {
+    local share="$1"
+    if [ -z "$EXCLUDE_SHARES" ]; then
+        return 1
+    fi
+    local excluded
+    IFS=',' read -ra excluded <<< "$EXCLUDE_SHARES"
+    for ex in "${excluded[@]}"; do
+        ex=$(echo "$ex" | xargs)
+        if [ "$ex" = "$share" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Parse mount error output into a clean, short reason
+parse_mount_error() {
+    local output="$1"
+    # Extract the core error reason, stripping the "Refer to..." noise
+    local reason
+    reason=$(echo "$output" | head -1 | sed 's/mount error([0-9]*): //')
+    echo "$reason"
+}
 
 discover_shares() {
     if ! check_nas; then return 1; fi
@@ -370,16 +421,25 @@ mount_all() {
     cred_opts=$(build_cred_opts)
     local mounted=0
     local failed=0
+    local denied=0
 
     # Check for fstab-managed shares
     local fstab_entries
     fstab_entries=$(get_fstab_entries "$NAS_IP")
     local skipped=0
+    local excluded=0
 
     echo ""
     while IFS= read -r share; do
         share=$(echo "$share" | xargs)
         [ -z "$share" ] && continue
+
+        # Check exclusion list
+        if is_excluded "$share"; then
+            echo -e "  ${YELLOW}⊘ $share — excluded${NC}"
+            ((excluded++))
+            continue
+        fi
 
         local mp="$MOUNT_BASE/$share"
 
@@ -419,16 +479,31 @@ mount_all() {
         elif [ $exit_code -eq 124 ]; then
             echo -e "${RED}✗ timed out after ${TIMEOUT}s${NC}"
             ((failed++))
+        elif echo "$mount_output" | grep -q "Permission denied\|error(13)"; then
+            echo -e "${YELLOW}⊘ no access (permission denied)${NC}"
+            ((denied++))
         else
-            echo -e "${RED}✗ $mount_output${NC}"
+            local reason
+            reason=$(parse_mount_error "$mount_output")
+            echo -e "${RED}✗ $reason${NC}"
             ((failed++))
         fi
     done <<< "$share_list"
 
     echo ""
     echo -e "${GREEN}Mounted: $mounted${NC}  ${RED}Failed: $failed${NC}"
+    [ $denied -gt 0 ] && echo -e "${YELLOW}No access: $denied (permission denied — check NAS user permissions)${NC}"
     [ $skipped -gt 0 ] && echo -e "${YELLOW}Skipped: $skipped (fstab-managed)${NC}"
+    [ $excluded -gt 0 ] && echo -e "${YELLOW}Excluded: $excluded${NC}"
     echo "Access shares at: $MOUNT_BASE/"
+}
+
+remount_all() {
+    echo -e "${BOLD}Remounting NAS shares...${NC}"
+    echo ""
+    unmount_all
+    echo ""
+    mount_all
 }
 
 unmount_all() {
@@ -663,6 +738,9 @@ generate_config() {
     echo -n "Shares (comma-separated, or Enter to auto-discover): "
     read -r cfg_shares
 
+    echo -n "Shares to exclude (comma-separated, or Enter for none): "
+    read -r cfg_exclude
+
     # Decide where to store the password
     local save_pass_to_config=true
     if has_keyring && [ -n "$cfg_user" ] && [ -n "$cfg_pass" ]; then
@@ -693,6 +771,7 @@ NAS_PASS="$cfg_pass"
 MOUNT_BASE="$cfg_mount"
 SMB_VERSION="$cfg_smb"
 SHARES="$cfg_shares"
+EXCLUDE_SHARES="$cfg_exclude"
 
 # Additional mount options (comma-separated)
 # MOUNT_OPTS="iocharset=utf8,file_mode=0775,dir_mode=0775,nofail"
@@ -708,6 +787,7 @@ NAS_USER="$cfg_user"
 MOUNT_BASE="$cfg_mount"
 SMB_VERSION="$cfg_smb"
 SHARES="$cfg_shares"
+EXCLUDE_SHARES="$cfg_exclude"
 
 # Additional mount options (comma-separated)
 # MOUNT_OPTS="iocharset=utf8,file_mode=0775,dir_mode=0775,nofail"
@@ -736,6 +816,7 @@ while [[ $# -gt 0 ]]; do
         -p|--pass)      NAS_PASS="$2";     shift 2 ;;
         -m|--mount)     MOUNT_BASE="$2";   shift 2 ;;
         -s|--shares)    SHARES="$2";       shift 2 ;;
+        -e|--exclude)   EXCLUDE_SHARES="$2"; shift 2 ;;
         --smb-version)  SMB_VERSION="$2";  shift 2 ;;
         --timeout|-t)   TIMEOUT="$2";      shift 2 ;;
         --dry-run)      DRY_RUN=true;      shift ;;
@@ -753,6 +834,7 @@ COMMAND="${POSITIONAL[0]:-}"
 
 case "${COMMAND:-}" in
     mount|m)          mount_all ;;
+    remount|r)        remount_all ;;
     unmount|umount|u) unmount_all ;;
     status|s)         show_status ;;
     discover|d)       discover_shares ;;

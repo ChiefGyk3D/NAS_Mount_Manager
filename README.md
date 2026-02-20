@@ -32,6 +32,7 @@ chmod +x mount-nas.sh
 | Command    | Short | Description                                    |
 |------------|-------|------------------------------------------------|
 | `mount`    | `m`   | Mount NAS shares (skips fstab-managed ones)    |
+| `remount`  | `r`   | Unmount and re-mount all NAS shares            |
 | `unmount`  | `u`   | Unmount all NAS shares (cleans empty dirs)     |
 | `status`   | `s`   | Show mount status, disk usage, and fstab info  |
 | `discover` | `d`   | List available SMB shares with descriptions    |
@@ -47,6 +48,7 @@ chmod +x mount-nas.sh
 -p, --pass PASS     SMB password
 -m, --mount PATH    Mount base path (default: ~/nas)
 -s, --shares LIST   Comma-separated share names
+-e, --exclude LIST  Comma-separated shares to skip (e.g. homes,photo)
 -t, --timeout SEC   Connection timeout in seconds (default: 30)
 --smb-version VER   SMB protocol version for mount (default: 3.0)
 --dry-run           Show what would be done without doing it
@@ -90,6 +92,7 @@ NAS_PASS="mypassword"
 MOUNT_BASE="/home/user/nas"
 SMB_VERSION="3.0"
 SHARES="media,backups,documents"
+EXCLUDE_SHARES="homes,photo"
 TIMEOUT=30
 ```
 
@@ -142,6 +145,7 @@ Preview what would happen without actually mounting anything:
 | `NAS_SHARES`      | Comma-separated share list           | *(auto-discover)*   |
 | `NAS_SMB_VERSION`  | SMB protocol version                | `3.0`               |
 | `NAS_MOUNT_OPTS`  | Additional mount options             | `iocharset=utf8,...` |
+| `NAS_EXCLUDE_SHARES`| Comma-separated shares to skip      | *(none)*            |
 | `NAS_TIMEOUT`     | Connection timeout (seconds)         | `30`                |
 | `NAS_CONFIG`      | Path to config file                  | `./nas.conf`        |
 | `NO_COLOR`        | Disable colored output (`true`)      | `false`             |
@@ -158,6 +162,7 @@ Then use from anywhere:
 
 ```bash
 nas mount          # Mount all shares
+nas remount        # Unmount and re-mount (e.g. to fix permissions)
 nas status         # Check what's connected
 nas unmount        # Disconnect everything
 nas -i 10.0.0.5 d  # Discover shares on a different NAS
@@ -187,6 +192,11 @@ environment:
 # Install keyring support
 sudo apt install libsecret-tools
 
+# The keyring requires a D-Bus session bus (available in desktop sessions).
+# If you're using SSH or a TTY without a desktop, start one first:
+#   eval $(dbus-launch --sh-syntax)
+#   gnome-keyring-daemon --start --components=secrets
+
 # The script will automatically:
 # 1. Check the keyring when a password is needed
 # 2. Offer to save new passwords to the keyring
@@ -207,6 +217,7 @@ sudo apt install libsecret-tools
 | `-p` flag | Shell history | ⚠️ Yes (briefly) | No |
 
 **Key security features:**
+- Mounted shares are **owned by your user** (not root) — the script automatically passes `uid=` and `gid=` to `mount.cifs`
 - Passwords are **never passed on the command line** to `mount` or `smbclient` — temporary credential files are used instead, so passwords don't appear in `/proc` or `ps` output
 - Temp credential files are created with `chmod 600` and **securely deleted** (`shred`) after use
 - Config files are excluded from git via `.gitignore`
