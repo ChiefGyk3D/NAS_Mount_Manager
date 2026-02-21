@@ -39,7 +39,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="1.6.0"
+VERSION="1.6.1"
 DISCOVERED_SHARES=""
 DRY_RUN=false
 NO_COLOR=${NO_COLOR:-false}
@@ -367,7 +367,7 @@ SMBEOF
     fi
 
     local share_list
-    share_list=$(echo "$output" | grep -i "Disk" | awk '{print $1}' | grep -v '^\$' | grep -v 'IPC')
+    share_list=$(echo "$output" | grep -i "Disk" | awk '{print $1}' | grep -Fv '$' | grep -v 'IPC')
 
     if [ -n "$share_list" ]; then
         echo ""
@@ -389,7 +389,7 @@ SMBEOF
                     echo -e "  ${CYAN}•${NC} $sname"
                 fi
             fi
-        done <<< "$(echo "$output" | grep -i 'Disk' | grep -v 'IPC')"
+        done <<< "$(echo "$output" | grep -i 'Disk' | grep -Fv '$' | grep -v 'IPC')"
         echo ""
         DISCOVERED_SHARES="$share_list"
         return 0
@@ -462,7 +462,7 @@ mount_all() {
         # Check if this share is managed by fstab
         if is_in_fstab "$NAS_IP" "$share"; then
             local fstab_mp
-            fstab_mp=$(echo "$fstab_entries" | grep "//$NAS_IP/$share \|//$NAS_IP/$share\t" | awk '{print $2}' | head -1)
+            fstab_mp=$(echo "$fstab_entries" | grep -E "//$NAS_IP/$share[[:space:]]" | awk '{print $2}' | head -1)
             echo -e "  ${YELLOW}⊘ $share — managed by fstab (mount point: ${fstab_mp:-$mp})${NC}"
             echo -e "    ${CYAN}Use 'sudo mount $fstab_mp' or just 'cd $fstab_mp' if using automount${NC}"
             ((skipped++))
@@ -687,7 +687,16 @@ generate_fstab() {
     echo -n "Would you like to install these fstab entries now? (y/N): "
     read -r answer
     if [[ "$answer" =~ ^[Yy] ]]; then
-        install_fstab "$share_list" "$cred_file"
+        # Filter out excluded shares before passing to install_fstab
+        local filtered_list=""
+        while IFS= read -r share; do
+            share=$(echo "$share" | xargs)
+            [ -z "$share" ] && continue
+            is_excluded "$share" && continue
+            filtered_list="${filtered_list}${share}"$'\n'
+        done <<< "$share_list"
+        filtered_list=$(echo "$filtered_list" | sed '/^$/d')
+        install_fstab "$filtered_list" "$cred_file"
     fi
 }
 
@@ -937,6 +946,15 @@ EOF
     chmod 600 "$CONFIG_FILE"
 }
 
+# Validate that a value is a positive integer
+validate_positive_int() {
+    local name="$1" value="$2"
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -eq 0 ]; then
+        echo -e "${RED}Error: $name must be a positive integer (got '$value')${NC}" >&2
+        exit 1
+    fi
+}
+
 # ── Parse CLI arguments ──────────────────────────────────────────────────────
 
 # Collect ALL args first so flags can appear before or after the command
@@ -968,6 +986,13 @@ done
 
 # First positional arg is the command
 COMMAND="${POSITIONAL[0]:-}"
+
+# Validate numeric inputs
+validate_positive_int "--timeout"     "$TIMEOUT"
+validate_positive_int "--cache-time"  "$CACHE_TIME"
+validate_positive_int "--rsize"       "$RSIZE"
+validate_positive_int "--wsize"       "$WSIZE"
+validate_positive_int "--max-credits" "$MAX_CREDITS"
 
 case "${COMMAND:-}" in
     mount|m)          mount_all ;;
