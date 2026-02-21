@@ -50,6 +50,7 @@ chmod +x mount-nas.sh
 -s, --shares LIST   Comma-separated share names
 -e, --exclude LIST  Comma-separated shares to skip (e.g. homes,photo)
 -t, --timeout SEC   Connection timeout in seconds (default: 30)
+--cache-time SEC    Attribute cache timeout in seconds (default: 10)
 --smb-version VER   SMB protocol version for mount (default: 3.0)
 --dry-run           Show what would be done without doing it
 --no-color          Disable colored output
@@ -93,6 +94,7 @@ MOUNT_BASE="/home/user/nas"
 SMB_VERSION="3.0"
 SHARES="media,backups,documents"
 EXCLUDE_SHARES="homes,photo"
+CACHE_TIME=10
 TIMEOUT=30
 ```
 
@@ -110,6 +112,7 @@ This generates laptop-friendly entries with `noauto,x-systemd.automount,x-system
 Shares auto-mount when you `cd` into them and auto-disconnect after 60 seconds of inactivity.
 
 Generated entries include `uid=` and `gid=` so mounted files are **owned by your user**, not root.
+The `actimeo` value (set via `--cache-time`) is baked into each entry for consistent caching.
 The `--exclude` / `-e` flag is respected — excluded shares are omitted from generated entries.
 
 The tool will:
@@ -152,6 +155,7 @@ Preview what would happen without actually mounting anything:
 | `NAS_SMB_VERSION`  | SMB protocol version                | `3.0`               |
 | `NAS_MOUNT_OPTS`  | Additional mount options             | `iocharset=utf8,...` |
 | `NAS_EXCLUDE_SHARES`| Comma-separated shares to skip      | *(none)*            |
+| `NAS_CACHE_TIME`  | Attribute cache timeout (seconds)    | `10`                |
 | `NAS_TIMEOUT`     | Connection timeout (seconds)         | `30`                |
 | `NAS_CONFIG`      | Path to config file                  | `./nas.conf`        |
 | `NO_COLOR`        | Disable colored output (`true`)      | `false`             |
@@ -228,6 +232,35 @@ sudo apt install libsecret-tools
 - Temp credential files are stored in `$XDG_RUNTIME_DIR` (`/run/user/$UID`, a user-private tmpfs), created with `chmod 600`, and **securely deleted** (`shred`) after use
 - Config files are excluded from git via `.gitignore`
 - The `-p` flag is available for scripting but not recommended for interactive use
+
+## Performance Tuning
+
+### Attribute Caching (`actimeo`)
+
+The `--cache-time` option controls how long the kernel caches file and directory
+metadata (size, timestamps, permissions) before re-checking with the NAS.
+The default is **10 seconds**, which works well over WiFi.
+
+```bash
+# Lower value = fresher metadata, more network chatter
+./mount-nas.sh --cache-time 1 mount
+
+# Higher value = better performance, slightly stale metadata
+./mount-nas.sh --cache-time 30 mount
+```
+
+| Value | Best For |
+|-------|----------|
+| `1`   | Multi-user editing where freshness matters |
+| `10`  | General use, WiFi connections (default) |
+| `30`  | Read-heavy workloads, media streaming |
+| `60`  | Archival / backup shares you rarely write to |
+
+### Network Recommendations
+
+- **Ethernet** is always preferred for NAS access — consistent latency and full throughput
+- **5 GHz WiFi** is a good alternative if Ethernet isn't available
+- **2.4 GHz WiFi** works but may cause noticeable lag on directory listings; increase `--cache-time` to help
 
 ## License
 
