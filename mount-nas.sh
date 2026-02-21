@@ -667,7 +667,74 @@ install_fstab() {
     local cred_file="$2"
 
     echo ""
-    # Create credential file
+
+    # ── Test mount each share before touching fstab ──────────────────────
+    echo -e "${BOLD}Testing mount points before writing to fstab...${NC}"
+    if ! check_nas; then
+        echo -e "${RED}Cannot reach NAS at $NAS_IP — aborting fstab install${NC}"
+        return 1
+    fi
+
+    local cred_opts
+    cred_opts=$(build_cred_opts)
+    local verified_shares=""
+    local test_failed=0
+
+    while IFS= read -r share; do
+        share=$(echo "$share" | xargs)
+        [ -z "$share" ] && continue
+        local test_mp
+        test_mp=$(mktemp -d "/tmp/nas-test-mount.XXXXXX")
+
+        echo -n "  Testing //$NAS_IP/$share ... "
+
+        local mount_output
+        mount_output=$(sudo timeout "$TIMEOUT" mount -t cifs "//$NAS_IP/$share" "$test_mp" -o "$cred_opts" 2>&1)
+        local exit_code=$?
+
+        if [ $exit_code -eq 0 ]; then
+            echo -e "${GREEN}✓ OK${NC}"
+            sudo umount "$test_mp" 2>/dev/null
+            verified_shares="${verified_shares}${share}"$'\n'
+        elif [ $exit_code -eq 124 ]; then
+            echo -e "${RED}✗ timed out after ${TIMEOUT}s — skipping${NC}"
+            ((test_failed++))
+        elif echo "$mount_output" | grep -q "Permission denied\|error(13)"; then
+            echo -e "${YELLOW}⊘ permission denied — skipping${NC}"
+            ((test_failed++))
+        else
+            local reason
+            reason=$(parse_mount_error "$mount_output")
+            echo -e "${RED}✗ $reason — skipping${NC}"
+            ((test_failed++))
+        fi
+        rmdir "$test_mp" 2>/dev/null
+    done <<< "$share_list"
+
+    cleanup_credentials
+
+    # Strip trailing newline
+    verified_shares=$(echo "$verified_shares" | sed '/^$/d')
+
+    if [ -z "$verified_shares" ]; then
+        echo -e "${RED}No shares passed the mount test — nothing added to fstab${NC}"
+        return 1
+    fi
+
+    if [ $test_failed -gt 0 ]; then
+        echo ""
+        echo -e "${YELLOW}$test_failed share(s) failed testing and will be skipped.${NC}"
+        echo -n "Continue adding the verified shares to fstab? (y/N): "
+        read -r cont
+        if [[ ! "$cont" =~ ^[Yy] ]]; then
+            echo "Aborted."
+            return 1
+        fi
+    fi
+
+    echo ""
+
+    # ── Create credential file ───────────────────────────────────────────
     echo -e "Creating credentials file at ${CYAN}$cred_file${NC}..."
     sudo bash -c "cat > $cred_file" <<EOF
 username=${NAS_USER:-guest}
@@ -681,7 +748,7 @@ EOF
         share=$(echo "$share" | xargs)
         [ -z "$share" ] && continue
         sudo mkdir -p "$MOUNT_BASE/$share"
-    done <<< "$share_list"
+    done <<< "$verified_shares"
     echo -e "${GREEN}✓ Mount points created${NC}"
 
     # Backup fstab
@@ -701,7 +768,7 @@ EOF
             echo "$entry" | sudo tee -a /etc/fstab >/dev/null
             echo -e "${GREEN}✓ Added $share to fstab${NC}"
         fi
-    done <<< "$share_list"
+    done <<< "$verified_shares"
 
     echo ""
     echo -e "${GREEN}Done! Reload systemd and mount with:${NC}"
