@@ -21,6 +21,9 @@ MOUNT_OPTS="${NAS_MOUNT_OPTS:-iocharset=utf8,file_mode=0775,dir_mode=0775,nofail
 TIMEOUT=${NAS_TIMEOUT:-30}
 EXCLUDE_SHARES="${NAS_EXCLUDE_SHARES:-}"
 CACHE_TIME=${NAS_CACHE_TIME:-10}
+RSIZE=${NAS_RSIZE:-4194304}
+WSIZE=${NAS_WSIZE:-4194304}
+MAX_CREDITS=${NAS_MAX_CREDITS:-128}
 
 # Load config file if it exists
 if [ -f "$CONFIG_FILE" ]; then
@@ -36,7 +39,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 DISCOVERED_SHARES=""
 DRY_RUN=false
 NO_COLOR=${NO_COLOR:-false}
@@ -112,6 +115,9 @@ usage() {
     echo "  -e, --exclude LIST Comma-separated shares to skip (e.g. homes,photo)"
     echo "  -t, --timeout SEC Connection timeout in seconds (default: $TIMEOUT)"
     echo "  --cache-time SEC  Attribute cache timeout in seconds (default: $CACHE_TIME)"
+    echo "  --rsize BYTES     Read buffer size (default: $RSIZE / $((RSIZE/1048576))MB)"
+    echo "  --wsize BYTES     Write buffer size (default: $WSIZE / $((WSIZE/1048576))MB)"
+    echo "  --max-credits N   SMB3 max credits / request parallelism (default: $MAX_CREDITS)"
     echo "  --smb-version VER SMB protocol version (default: $SMB_VERSION)"
     echo "  --dry-run         Show what would be done without doing it"
     echo "  --no-color        Disable colored output"
@@ -121,7 +127,8 @@ usage() {
     echo "Environment Variables:"
     echo "  NAS_IP, NAS_USER, NAS_PASS, NAS_MOUNT_BASE, NAS_SHARES,"
     echo "  NAS_SMB_VERSION, NAS_MOUNT_OPTS, NAS_CONFIG, NAS_TIMEOUT,"
-    echo "  NAS_EXCLUDE_SHARES, NAS_CACHE_TIME, NO_COLOR"
+    echo "  NAS_EXCLUDE_SHARES, NAS_CACHE_TIME, NAS_RSIZE, NAS_WSIZE,"
+    echo "  NAS_MAX_CREDITS, NO_COLOR"
     echo ""
     echo "Config File: $CONFIG_FILE"
     echo ""
@@ -286,7 +293,7 @@ build_cred_opts() {
     # Map ownership to the invoking user (SUDO_UID/GID if run via sudo, else current user)
     local mount_uid=${SUDO_UID:-$(id -u)}
     local mount_gid=${SUDO_GID:-$(id -g)}
-    opts="$opts,uid=$mount_uid,gid=$mount_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,$MOUNT_OPTS"
+    opts="$opts,uid=$mount_uid,gid=$mount_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,rsize=$RSIZE,wsize=$WSIZE,max_credits=$MAX_CREDITS,$MOUNT_OPTS"
     echo "$opts"
 }
 
@@ -643,7 +650,7 @@ generate_fstab() {
             continue
         fi
         local mp="$MOUNT_BASE/$share"
-        echo "//$NAS_IP/$share  $mp  cifs  credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,$MOUNT_OPTS,noauto,x-systemd.automount,x-systemd.idle-timeout=60  0  0"
+        echo "//$NAS_IP/$share  $mp  cifs  credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,rsize=$RSIZE,wsize=$WSIZE,max_credits=$MAX_CREDITS,$MOUNT_OPTS,noauto,x-systemd.automount,x-systemd.idle-timeout=60  0  0"
     done <<< "$share_list"
 
     [ $excluded_count -gt 0 ] && echo -e "\n${YELLOW}($excluded_count excluded share(s) omitted)${NC}"
@@ -791,7 +798,7 @@ EOF
         share=$(echo "$share" | xargs)
         [ -z "$share" ] && continue
         local mp="$MOUNT_BASE/$share"
-        local entry="//$NAS_IP/$share  $mp  cifs  credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,$MOUNT_OPTS,noauto,x-systemd.automount,x-systemd.idle-timeout=60  0  0"
+        local entry="//$NAS_IP/$share  $mp  cifs  credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,rsize=$RSIZE,wsize=$WSIZE,max_credits=$MAX_CREDITS,$MOUNT_OPTS,noauto,x-systemd.automount,x-systemd.idle-timeout=60  0  0"
 
         if grep -qE "//$NAS_IP/$share[[:space:]]" /etc/fstab 2>/dev/null; then
             echo -e "${YELLOW}⊘ $share already in fstab — skipped${NC}"
@@ -847,6 +854,18 @@ generate_config() {
     read -r input_cache
     local cfg_cache="${input_cache:-$CACHE_TIME}"
 
+    echo -n "Read buffer size in bytes [$RSIZE] (4194304 = 4MB, good for large files): "
+    read -r input_rsize
+    local cfg_rsize="${input_rsize:-$RSIZE}"
+
+    echo -n "Write buffer size in bytes [$WSIZE] (4194304 = 4MB, good for large files): "
+    read -r input_wsize
+    local cfg_wsize="${input_wsize:-$WSIZE}"
+
+    echo -n "SMB3 max credits [$MAX_CREDITS] (higher = more parallel requests): "
+    read -r input_credits
+    local cfg_credits="${input_credits:-$MAX_CREDITS}"
+
     # Decide where to store the password
     local save_pass_to_config=true
     if has_keyring && [ -n "$cfg_user" ] && [ -n "$cfg_pass" ]; then
@@ -879,6 +898,9 @@ SMB_VERSION="$cfg_smb"
 SHARES="$cfg_shares"
 EXCLUDE_SHARES="$cfg_exclude"
 CACHE_TIME="$cfg_cache"
+RSIZE="$cfg_rsize"
+WSIZE="$cfg_wsize"
+MAX_CREDITS="$cfg_credits"
 
 # Additional mount options (comma-separated)
 # MOUNT_OPTS="iocharset=utf8,file_mode=0775,dir_mode=0775,nofail"
@@ -896,6 +918,9 @@ SMB_VERSION="$cfg_smb"
 SHARES="$cfg_shares"
 EXCLUDE_SHARES="$cfg_exclude"
 CACHE_TIME="$cfg_cache"
+RSIZE="$cfg_rsize"
+WSIZE="$cfg_wsize"
+MAX_CREDITS="$cfg_credits"
 
 # Additional mount options (comma-separated)
 # MOUNT_OPTS="iocharset=utf8,file_mode=0775,dir_mode=0775,nofail"
@@ -928,6 +953,9 @@ while [[ $# -gt 0 ]]; do
         --smb-version)  SMB_VERSION="$2";  shift 2 ;;
         --timeout|-t)   TIMEOUT="$2";      shift 2 ;;
         --cache-time)   CACHE_TIME="$2";     shift 2 ;;
+        --rsize)        RSIZE="$2";          shift 2 ;;
+        --wsize)        WSIZE="$2";          shift 2 ;;
+        --max-credits)  MAX_CREDITS="$2";    shift 2 ;;
         --dry-run)      DRY_RUN=true;      shift ;;
         --no-color)     GREEN='' RED='' YELLOW='' CYAN='' BOLD='' NC=''; shift ;;
         --version)      echo "NAS Mount Manager v$VERSION"; exit 0 ;;

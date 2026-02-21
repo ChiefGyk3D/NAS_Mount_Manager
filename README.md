@@ -51,6 +51,9 @@ chmod +x mount-nas.sh
 -e, --exclude LIST  Comma-separated shares to skip (e.g. homes,photo)
 -t, --timeout SEC   Connection timeout in seconds (default: 30)
 --cache-time SEC    Attribute cache timeout in seconds (default: 10)
+--rsize BYTES       Read buffer size in bytes (default: 4194304 / 4MB)
+--wsize BYTES       Write buffer size in bytes (default: 4194304 / 4MB)
+--max-credits N     SMB3 max credits / request parallelism (default: 128)
 --smb-version VER   SMB protocol version for mount (default: 3.0)
 --dry-run           Show what would be done without doing it
 --no-color          Disable colored output
@@ -95,6 +98,9 @@ SMB_VERSION="3.0"
 SHARES="media,backups,documents"
 EXCLUDE_SHARES="homes,photo"
 CACHE_TIME=10
+RSIZE=4194304
+WSIZE=4194304
+MAX_CREDITS=128
 TIMEOUT=30
 ```
 
@@ -156,6 +162,9 @@ Preview what would happen without actually mounting anything:
 | `NAS_MOUNT_OPTS`  | Additional mount options             | `iocharset=utf8,...` |
 | `NAS_EXCLUDE_SHARES`| Comma-separated shares to skip      | *(none)*            |
 | `NAS_CACHE_TIME`  | Attribute cache timeout (seconds)    | `10`                |
+| `NAS_RSIZE`       | Read buffer size (bytes)             | `4194304` (4MB)     |
+| `NAS_WSIZE`       | Write buffer size (bytes)            | `4194304` (4MB)     |
+| `NAS_MAX_CREDITS` | SMB3 max credits (parallelism)       | `128`               |
 | `NAS_TIMEOUT`     | Connection timeout (seconds)         | `30`                |
 | `NAS_CONFIG`      | Path to config file                  | `./nas.conf`        |
 | `NO_COLOR`        | Disable colored output (`true`)      | `false`             |
@@ -235,6 +244,32 @@ sudo apt install libsecret-tools
 
 ## Performance Tuning
 
+### Large File Transfers (`rsize` / `wsize`)
+
+The `--rsize` and `--wsize` options control the read and write buffer sizes for
+CIFS transfers. The default is **4MB** (4194304 bytes), which dramatically reduces
+round-trip overhead compared to the kernel default of 1MB — especially over WiFi
+where each round trip has high latency.
+
+```bash
+# Defaults are already optimized for large transfers
+./mount-nas.sh mount
+
+# Explicitly set buffer sizes
+./mount-nas.sh --rsize 4194304 --wsize 4194304 mount
+```
+
+### SMB3 Parallelism (`max_credits`)
+
+The `--max-credits` option controls how many simultaneous SMB3 requests the client
+can issue. The default is **128** (kernel default is 64). Higher values allow more
+parallel I/O operations, improving throughput for large file transfers and
+multi-file operations.
+
+```bash
+./mount-nas.sh --max-credits 128 mount
+```
+
 ### Attribute Caching (`actimeo`)
 
 The `--cache-time` option controls how long the kernel caches file and directory
@@ -256,11 +291,22 @@ The default is **10 seconds**, which works well over WiFi.
 | `30`  | Read-heavy workloads, media streaming |
 | `60`  | Archival / backup shares you rarely write to |
 
+### Downloading Large Files (ISOs, etc.)
+
+For large downloads like ISOs, download directly on the NAS via SSH to bypass
+your WiFi link entirely. The NAS is typically wired to your router at gigabit
+speed, so downloads go **internet → router → NAS** instead of through your WiFi:
+
+```bash
+# One-liner: download directly on the NAS
+ssh user@nas-ip 'wget -P /volume1/share/ "https://example.com/file.iso"'
+```
+
 ### Network Recommendations
 
 - **Ethernet** is always preferred for NAS access — consistent latency and full throughput
 - **5 GHz WiFi** is a good alternative if Ethernet isn't available
-- **2.4 GHz WiFi** works but may cause noticeable lag on directory listings; increase `--cache-time` to help
+- **2.4 GHz WiFi** works but may cause noticeable lag on directory listings; the default buffer sizes and cache settings help compensate
 
 ## License
 
