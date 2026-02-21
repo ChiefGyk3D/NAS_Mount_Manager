@@ -35,7 +35,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 DISCOVERED_SHARES=""
 DRY_RUN=false
 NO_COLOR=${NO_COLOR:-false}
@@ -56,7 +56,9 @@ get_fstab_entries() {
 # Check if a specific share is already in fstab
 is_in_fstab() {
     local ip="$1" share="$2"
-    grep -q "//$ip/$share" /etc/fstab 2>/dev/null
+    # Anchor match: //ip/share followed by whitespace to avoid substring matches
+    # e.g. "home" must not match "homes"
+    grep -qE "//$ip/$share[[:space:]]" /etc/fstab 2>/dev/null
 }
 
 # Show fstab status for current NAS
@@ -165,10 +167,14 @@ has_keyring() {
     # Need a D-Bus session bus (required for secret-tool to talk to keyring)
     [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || return 1
     # Quick check: can we reach the secrets service at all?
-    secret-tool lookup service nas-mount-test key ping 2>/dev/null
-    # lookup returns 1 when key not found (which is fine — service is reachable)
-    # but returns other codes or hangs when service is unavailable
-    return 0
+    # Wrap in timeout to avoid hanging if the keyring daemon is unresponsive
+    timeout 3 secret-tool lookup service nas-mount-test key ping 2>/dev/null
+    local rc=$?
+    # rc=0: found (won't happen for this fake key)
+    # rc=1: not found — but service IS reachable, so keyring is available
+    # rc=124: timed out — service is unresponsive
+    # rc>1: other error — service is unavailable
+    [[ $rc -le 1 ]]
 }
 
 # Store password in system keyring
@@ -253,8 +259,9 @@ get_credentials() {
 # Create a temporary credentials file for mount (avoids password in /proc)
 # Returns the path to the temp file — caller must clean up
 create_temp_credentials() {
+    local tmpdir="${XDG_RUNTIME_DIR:-/tmp}"
     local tmpfile
-    tmpfile=$(mktemp /tmp/.nas-creds-XXXXXX)
+    tmpfile=$(mktemp "$tmpdir/.nas-creds-XXXXXX")
     chmod 600 "$tmpfile"
     cat > "$tmpfile" <<CREDEOF
 username=${NAS_USER}
@@ -336,7 +343,7 @@ discover_shares() {
     if [ -n "$NAS_USER" ]; then
         # Use authentication file for smbclient to avoid password in process list
         local smb_auth
-        smb_auth=$(mktemp /tmp/.nas-smb-auth-XXXXXX)
+        smb_auth=$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/.nas-smb-auth-XXXXXX")
         chmod 600 "$smb_auth"
         cat > "$smb_auth" <<SMBEOF
 username=${NAS_USER}
@@ -463,7 +470,7 @@ mount_all() {
 
         echo -n "  Mounting //$NAS_IP/$share → $mp ... "
 
-        if mount | grep -q " $mp "; then
+        if mountpoint -q "$mp" 2>/dev/null; then
             echo -e "${YELLOW}already mounted${NC}"
             ((mounted++))
             continue
@@ -518,7 +525,7 @@ unmount_all() {
     for mp in "$MOUNT_BASE"/*/; do
         [ ! -d "$mp" ] && continue
 
-        if mount | grep -q " ${mp%/} "; then
+        if mountpoint -q "${mp%/}" 2>/dev/null; then
             echo -n "  Unmounting ${mp%/} ... "
             if sudo umount -l "${mp%/}" 2>/dev/null; then
                 echo -e "${GREEN}✓${NC}"
@@ -538,7 +545,7 @@ unmount_all() {
     # Clean up empty mount directories
     for mp in "$MOUNT_BASE"/*/; do
         [ ! -d "$mp" ] && continue
-        if ! mount | grep -q " ${mp%/} " && [ -z "$(ls -A "${mp%/}" 2>/dev/null)" ]; then
+        if ! mountpoint -q "${mp%/}" 2>/dev/null && [ -z "$(ls -A "${mp%/}" 2>/dev/null)" ]; then
             rmdir "${mp%/}" 2>/dev/null
         fi
     done
@@ -578,7 +585,7 @@ show_status() {
         [ ! -d "$mp" ] && continue
         local name
         name=$(basename "$mp")
-        if mount | grep -q " ${mp%/} "; then
+        if mountpoint -q "${mp%/}" 2>/dev/null; then
             local size
             size=$(df -h "${mp%/}" 2>/dev/null | tail -1 | awk '{print $3 "/" $2 " (" $5 " used)"}')
             echo -e "    ${GREEN}● $name${NC}  $size"
@@ -589,6 +596,7 @@ show_status() {
     done
 
     [ $mounted -eq 0 ] && echo "    No shares currently mounted"
+    return 0
 }
 
 generate_fstab() {
@@ -615,17 +623,28 @@ generate_fstab() {
 
     local cred_file="/etc/nas-credentials"
 
+    # Resolve the real user's UID/GID (works whether invoked directly or via sudo)
+    local fstab_uid=${SUDO_UID:-$(id -u)}
+    local fstab_gid=${SUDO_GID:-$(id -g)}
+
     echo ""
     echo -e "${BOLD}Generated /etc/fstab entries:${NC}"
     echo "────────────────────────────────────────────"
     echo ""
 
+    local excluded_count=0
     while IFS= read -r share; do
         share=$(echo "$share" | xargs)
         [ -z "$share" ] && continue
+        if is_excluded "$share"; then
+            ((excluded_count++))
+            continue
+        fi
         local mp="$MOUNT_BASE/$share"
-        echo "//$NAS_IP/$share  $mp  cifs  credentials=$cred_file,vers=$SMB_VERSION,$MOUNT_OPTS,noauto,x-systemd.automount,x-systemd.idle-timeout=60  0  0"
+        echo "//$NAS_IP/$share  $mp  cifs  credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,$MOUNT_OPTS,noauto,x-systemd.automount,x-systemd.idle-timeout=60  0  0"
     done <<< "$share_list"
+
+    [ $excluded_count -gt 0 ] && echo -e "\n${YELLOW}($excluded_count excluded share(s) omitted)${NC}"
 
     echo ""
     echo "────────────────────────────────────────────"
@@ -643,6 +662,7 @@ generate_fstab() {
     while IFS= read -r share; do
         share=$(echo "$share" | xargs)
         [ -z "$share" ] && continue
+        is_excluded "$share" && continue
         echo -e "     ${CYAN}sudo mkdir -p $MOUNT_BASE/$share${NC}"
     done <<< "$share_list"
     echo ""
@@ -736,18 +756,23 @@ install_fstab() {
 
     # ── Create credential file ───────────────────────────────────────────
     echo -e "Creating credentials file at ${CYAN}$cred_file${NC}..."
-    sudo bash -c "cat > $cred_file" <<EOF
+    sudo tee "$cred_file" > /dev/null <<EOF
 username=${NAS_USER:-guest}
 password=${NAS_PASS:-}
 EOF
     sudo chmod 600 "$cred_file"
     echo -e "${GREEN}✓ Credentials file created${NC}"
 
-    # Create mount points
+    # Create mount points (owned by the invoking user, not root)
+    local mount_uid=${SUDO_UID:-$(id -u)}
+    local mount_gid=${SUDO_GID:-$(id -g)}
+    sudo mkdir -p "$MOUNT_BASE"
+    sudo chown "$mount_uid:$mount_gid" "$MOUNT_BASE"
     while IFS= read -r share; do
         share=$(echo "$share" | xargs)
         [ -z "$share" ] && continue
         sudo mkdir -p "$MOUNT_BASE/$share"
+        sudo chown "$mount_uid:$mount_gid" "$MOUNT_BASE/$share"
     done <<< "$verified_shares"
     echo -e "${GREEN}✓ Mount points created${NC}"
 
@@ -755,14 +780,18 @@ EOF
     sudo cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
     echo -e "${GREEN}✓ Backed up /etc/fstab${NC}"
 
+    # Resolve the real user's UID/GID (works whether invoked directly or via sudo)
+    local fstab_uid=${SUDO_UID:-$(id -u)}
+    local fstab_gid=${SUDO_GID:-$(id -g)}
+
     # Add entries (skip if already present)
     while IFS= read -r share; do
         share=$(echo "$share" | xargs)
         [ -z "$share" ] && continue
         local mp="$MOUNT_BASE/$share"
-        local entry="//$NAS_IP/$share  $mp  cifs  credentials=$cred_file,vers=$SMB_VERSION,$MOUNT_OPTS,noauto,x-systemd.automount,x-systemd.idle-timeout=60  0  0"
+        local entry="//$NAS_IP/$share  $mp  cifs  credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,$MOUNT_OPTS,noauto,x-systemd.automount,x-systemd.idle-timeout=60  0  0"
 
-        if grep -q "//$NAS_IP/$share" /etc/fstab 2>/dev/null; then
+        if grep -qE "//$NAS_IP/$share[[:space:]]" /etc/fstab 2>/dev/null; then
             echo -e "${YELLOW}⊘ $share already in fstab — skipped${NC}"
         else
             echo "$entry" | sudo tee -a /etc/fstab >/dev/null
@@ -771,9 +800,13 @@ EOF
     done <<< "$verified_shares"
 
     echo ""
-    echo -e "${GREEN}Done! Reload systemd and mount with:${NC}"
-    echo -e "  ${CYAN}sudo systemctl daemon-reload${NC}"
-    echo -e "  ${CYAN}sudo mount -a${NC}"
+    echo -e "${BOLD}Activating mounts...${NC}"
+    sudo systemctl daemon-reload
+    echo -e "${GREEN}✓ systemd reloaded${NC}"
+    sudo mount -a 2>&1
+    echo -e "${GREEN}✓ mount -a complete${NC}"
+    echo ""
+    echo -e "${GREEN}Done! Shares will auto-mount on access at $MOUNT_BASE/${NC}"
 }
 
 generate_config() {

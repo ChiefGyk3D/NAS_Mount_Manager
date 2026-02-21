@@ -109,11 +109,17 @@ The config file is automatically set to `chmod 600` and ignored by `.gitignore`.
 This generates laptop-friendly entries with `noauto,x-systemd.automount,x-systemd.idle-timeout=60`.
 Shares auto-mount when you `cd` into them and auto-disconnect after 60 seconds of inactivity.
 
+Generated entries include `uid=` and `gid=` so mounted files are **owned by your user**, not root.
+The `--exclude` / `-e` flag is respected — excluded shares are omitted from generated entries.
+
 The tool will:
+- **Test-mount each share** before touching fstab (skips any that fail)
 - Show the generated fstab lines
 - Offer to install them automatically
 - Back up `/etc/fstab` before any changes
 - Create a secure credentials file at `/etc/nas-credentials` (chmod 600)
+- Create mount directories **owned by your user** (not root)
+- **Auto-run** `systemctl daemon-reload` and `mount -a`
 - **Skip shares already in fstab** to prevent duplicates
 
 ### Fstab-Aware Mounting
@@ -155,7 +161,7 @@ Preview what would happen without actually mounting anything:
 Add to `~/.bashrc` or `~/.zshrc`:
 
 ```bash
-alias nas='~/src/NAS_mount/mount-nas.sh'
+alias nas='~/src/NAS_Mount_Manager/mount-nas.sh'
 ```
 
 Then use from anywhere:
@@ -217,9 +223,9 @@ sudo apt install libsecret-tools
 | `-p` flag | Shell history | ⚠️ Yes (briefly) | No |
 
 **Key security features:**
-- Mounted shares are **owned by your user** (not root) — the script automatically passes `uid=` and `gid=` to `mount.cifs`
+- Mounted shares are **owned by your user** (not root) — the script automatically passes `uid=` and `gid=` to `mount.cifs`, both for interactive mounts and fstab entries
 - Passwords are **never passed on the command line** to `mount` or `smbclient` — temporary credential files are used instead, so passwords don't appear in `/proc` or `ps` output
-- Temp credential files are created with `chmod 600` and **securely deleted** (`shred`) after use
+- Temp credential files are stored in `$XDG_RUNTIME_DIR` (`/run/user/$UID`, a user-private tmpfs), created with `chmod 600`, and **securely deleted** (`shred`) after use
 - Config files are excluded from git via `.gitignore`
 - The `-p` flag is available for scripting but not recommended for interactive use
 
