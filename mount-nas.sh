@@ -16,14 +16,19 @@ MOUNT_BASE="${NAS_MOUNT_BASE:-$HOME/nas}"
 NAS_USER="${NAS_USER:-}"
 NAS_PASS="${NAS_PASS:-}"
 SHARES="${NAS_SHARES:-}"
+PROTOCOL="${NAS_PROTOCOL:-smb}"       # smb or nfs
 SMB_VERSION="${NAS_SMB_VERSION:-3.0}"
-MOUNT_OPTS="${NAS_MOUNT_OPTS:-iocharset=utf8,file_mode=0775,dir_mode=0775,nofail}"
+NFS_VERSION="${NAS_NFS_VERSION:-4.2}"
+MOUNT_OPTS="${NAS_MOUNT_OPTS:-}"
 TIMEOUT=${NAS_TIMEOUT:-30}
 EXCLUDE_SHARES="${NAS_EXCLUDE_SHARES:-}"
 CACHE_TIME=${NAS_CACHE_TIME:-10}
 RSIZE=${NAS_RSIZE:-4194304}
 WSIZE=${NAS_WSIZE:-4194304}
 MAX_CREDITS=${NAS_MAX_CREDITS:-128}
+NFS_NCONNECT=${NAS_NFS_NCONNECT:-0}
+NFS_TIMEO=${NAS_NFS_TIMEO:-150}
+NFS_RETRANS=${NAS_NFS_RETRANS:-3}
 
 # Load config file if it exists
 if [ -f "$CONFIG_FILE" ]; then
@@ -39,7 +44,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="1.6.1"
+VERSION="2.0.0"
 DISCOVERED_SHARES=""
 DRY_RUN=false
 NO_COLOR=${NO_COLOR:-false}
@@ -49,20 +54,71 @@ if [[ "$NO_COLOR" == "true" ]] || [[ ! -t 1 ]]; then
     GREEN='' RED='' YELLOW='' CYAN='' BOLD='' NC=''
 fi
 
+# ── Protocol Helpers ──────────────────────────────────────────────────────────
+
+# Return the share source string for the current protocol
+# SMB: //IP/share   NFS: IP:/share
+share_source() {
+    local ip="$1" share="$2"
+    if [[ "$PROTOCOL" == "nfs" ]]; then
+        echo "$ip:/$share"
+    else
+        echo "//$ip/$share"
+    fi
+}
+
+# Return the default mount options for the current protocol (no credentials)
+default_mount_opts() {
+    if [[ "$PROTOCOL" == "nfs" ]]; then
+        echo "iocharset=utf8,nofail"
+    else
+        echo "iocharset=utf8,file_mode=0775,dir_mode=0775,nofail"
+    fi
+}
+
+# Return the fstab filesystem type for the current protocol
+fstab_fstype() {
+    if [[ "$PROTOCOL" == "nfs" ]]; then
+        echo "nfs"
+    else
+        echo "cifs"
+    fi
+}
+
+# Validate the PROTOCOL variable
+validate_protocol() {
+    case "$PROTOCOL" in
+        smb|nfs) ;;
+        *)
+            echo -e "${RED}Error: --protocol must be 'smb' or 'nfs' (got '$PROTOCOL')${NC}" >&2
+            exit 1
+            ;;
+    esac
+}
+
 # ── Fstab Helpers ────────────────────────────────────────────────────────────
 
 # Get all fstab entries for a given NAS IP
 get_fstab_entries() {
     local ip="$1"
-    grep -v '^#' /etc/fstab 2>/dev/null | grep "//$ip/" || true
+    if [[ "$PROTOCOL" == "nfs" ]]; then
+        grep -v '^#' /etc/fstab 2>/dev/null | grep "$ip:/" || true
+    else
+        grep -v '^#' /etc/fstab 2>/dev/null | grep "//$ip/" || true
+    fi
 }
 
 # Check if a specific share is already in fstab
 is_in_fstab() {
     local ip="$1" share="$2"
-    # Anchor match: //ip/share followed by whitespace to avoid substring matches
-    # e.g. "home" must not match "homes"
-    grep -qE "//$ip/$share[[:space:]]" /etc/fstab 2>/dev/null
+    if [[ "$PROTOCOL" == "nfs" ]]; then
+        # NFS format: IP:/share followed by whitespace
+        grep -qE "$ip:/$share[[:space:]]" /etc/fstab 2>/dev/null
+    else
+        # SMB format: //ip/share followed by whitespace
+        # Anchor match to avoid substring matches (e.g. "home" must not match "homes")
+        grep -qE "//$ip/$share[[:space:]]" /etc/fstab 2>/dev/null
+    fi
 }
 
 # Show fstab status for current NAS
@@ -73,7 +129,11 @@ show_fstab_status() {
         echo -e "  ${BOLD}Fstab entries for $NAS_IP:${NC}"
         while IFS= read -r line; do
             local share
-            share=$(echo "$line" | awk '{print $1}' | sed "s|//$NAS_IP/||")
+            if [[ "$PROTOCOL" == "nfs" ]]; then
+                share=$(echo "$line" | awk '{print $1}' | sed "s|$NAS_IP:/||")
+            else
+                share=$(echo "$line" | awk '{print $1}' | sed "s|//$NAS_IP/||")
+            fi
             local mp
             mp=$(echo "$line" | awk '{print $2}')
             local opts
@@ -101,44 +161,54 @@ usage() {
     echo "  remount,  r       Unmount and re-mount all NAS shares"
     echo "  unmount,  u       Unmount all NAS shares"
     echo "  status,   s       Show current mount status"
-    echo "  discover, d       Discover available SMB shares"
+    echo "  discover, d       Discover available shares (SMB or NFS)"
     echo "  fstab,    f       Generate /etc/fstab entries"
+    echo "  setup,    w       Interactive setup wizard (discover + mount)"
     echo "  config,   c       Generate a config file interactively"
     echo "  help,     h       Show this help"
     echo ""
     echo "Options:"
-    echo "  -i, --ip IP       NAS IP address (default: $NAS_IP)"
-    echo "  -u, --user USER   SMB username"
-    echo "  -p, --pass PASS   SMB password"
-    echo "  -m, --mount PATH  Mount base path (default: $MOUNT_BASE)"
-    echo "  -s, --shares LIST Comma-separated share names"
-    echo "  -e, --exclude LIST Comma-separated shares to skip (e.g. homes,photo)"
-    echo "  -t, --timeout SEC Connection timeout in seconds (default: $TIMEOUT)"
-    echo "  --cache-time SEC  Attribute cache timeout in seconds (default: $CACHE_TIME)"
-    echo "  --rsize BYTES     Read buffer size (default: $RSIZE / $((RSIZE/1048576))MB)"
-    echo "  --wsize BYTES     Write buffer size (default: $WSIZE / $((WSIZE/1048576))MB)"
-    echo "  --max-credits N   SMB3 max credits / request parallelism (default: $MAX_CREDITS)"
-    echo "  --smb-version VER SMB protocol version (default: $SMB_VERSION)"
-    echo "  --dry-run         Show what would be done without doing it"
-    echo "  --no-color        Disable colored output"
-    echo "  --config FILE     Path to config file"
-    echo "  --version         Show version"
+    echo "  -i, --ip IP         NAS IP address (default: $NAS_IP)"
+    echo "  --protocol TYPE     Protocol: smb or nfs (default: $PROTOCOL)"
+    echo "  -u, --user USER     SMB username"
+    echo "  -p, --pass PASS     SMB password"
+    echo "  -m, --mount PATH    Mount base path (default: $MOUNT_BASE)"
+    echo "  -s, --shares LIST   Comma-separated share names"
+    echo "  -e, --exclude LIST  Comma-separated shares to skip (e.g. homes,photo)"
+    echo "  -t, --timeout SEC   Connection timeout in seconds (default: $TIMEOUT)"
+    echo "  --cache-time SEC    Attribute cache timeout in seconds (default: $CACHE_TIME)"
+    echo "  --rsize BYTES       Read buffer size (default: $RSIZE / $((RSIZE/1048576))MB)"
+    echo "  --wsize BYTES       Write buffer size (default: $WSIZE / $((WSIZE/1048576))MB)"
+    echo "  --max-credits N     SMB3 max credits / request parallelism (default: $MAX_CREDITS)"
+    echo "  --smb-version VER   SMB protocol version (default: $SMB_VERSION)"
+    echo "  --nfs-version VER   NFS protocol version (default: $NFS_VERSION)"
+    echo "  --nfs-nconnect N    NFS multi-connection count, 0=disabled (default: $NFS_NCONNECT)"
+    echo "  --nfs-timeo DS      NFS timeout in deciseconds (default: $NFS_TIMEO)"
+    echo "  --nfs-retrans N     NFS retransmission count (default: $NFS_RETRANS)"
+    echo "  --dry-run           Show what would be done without doing it"
+    echo "  --no-color          Disable colored output"
+    echo "  --config FILE       Path to config file"
+    echo "  --version           Show version"
     echo ""
     echo "Environment Variables:"
-    echo "  NAS_IP, NAS_USER, NAS_PASS, NAS_MOUNT_BASE, NAS_SHARES,"
-    echo "  NAS_SMB_VERSION, NAS_MOUNT_OPTS, NAS_CONFIG, NAS_TIMEOUT,"
+    echo "  NAS_IP, NAS_PROTOCOL, NAS_USER, NAS_PASS, NAS_MOUNT_BASE, NAS_SHARES,"
+    echo "  NAS_SMB_VERSION, NAS_NFS_VERSION, NAS_MOUNT_OPTS, NAS_CONFIG, NAS_TIMEOUT,"
     echo "  NAS_EXCLUDE_SHARES, NAS_CACHE_TIME, NAS_RSIZE, NAS_WSIZE,"
-    echo "  NAS_MAX_CREDITS, NO_COLOR"
+    echo "  NAS_MAX_CREDITS, NAS_NFS_NCONNECT, NAS_NFS_TIMEO, NAS_NFS_RETRANS,"
+    echo "  NO_COLOR"
     echo ""
     echo "Config File: $CONFIG_FILE"
     echo ""
     echo "Examples:"
-    echo "  $(basename "$0") mount                           # Mount with defaults/config"
-    echo "  $(basename "$0") -i 10.0.0.5 discover            # Discover shares on different NAS"
-    echo "  $(basename "$0") -i 10.0.0.5 -u admin mount      # Mount with specific IP and user"
-    echo "  $(basename "$0") -s media,backups mount           # Mount specific shares only"
-    echo "  $(basename "$0") -e homes,photo mount             # Mount all except excluded shares"
-    echo "  $(basename "$0") fstab                            # Generate fstab entries"
+    echo "  $(basename "$0") mount                            # Mount with defaults/config"
+    echo "  $(basename "$0") --protocol nfs mount             # Mount NFS exports"
+    echo "  $(basename "$0") -i 10.0.0.5 discover             # Discover shares on different NAS"
+    echo "  $(basename "$0") --protocol nfs discover           # Discover NFS exports"
+    echo "  $(basename "$0") -i 10.0.0.5 -u admin mount       # Mount SMB with specific IP and user"
+    echo "  $(basename "$0") -s media,backups mount            # Mount specific shares only"
+    echo "  $(basename "$0") -e homes,photo mount              # Mount all except excluded shares"
+    echo "  $(basename "$0") setup                             # Interactive guided setup"
+    echo "  $(basename "$0") fstab                             # Generate fstab entries"
 }
 
 check_deps() {
@@ -146,12 +216,25 @@ check_deps() {
     for cmd in mount umount; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
-    if ! command -v mount.cifs &>/dev/null && ! [ -f /sbin/mount.cifs ]; then
-        missing+=("cifs-utils")
+    if [[ "$PROTOCOL" == "nfs" ]]; then
+        if ! command -v mount.nfs &>/dev/null && ! [ -f /sbin/mount.nfs ]; then
+            missing+=("nfs-common")
+        fi
+        if ! command -v showmount &>/dev/null; then
+            missing+=("nfs-common (showmount)")
+        fi
+    else
+        if ! command -v mount.cifs &>/dev/null && ! [ -f /sbin/mount.cifs ]; then
+            missing+=("cifs-utils")
+        fi
     fi
     if [ ${#missing[@]} -gt 0 ]; then
         echo -e "${RED}Missing required packages: ${missing[*]}${NC}"
-        echo "Install with: sudo apt install cifs-utils smbclient"
+        if [[ "$PROTOCOL" == "nfs" ]]; then
+            echo "Install with: sudo apt install nfs-common"
+        else
+            echo "Install with: sudo apt install cifs-utils smbclient"
+        fi
         return 1
     fi
 }
@@ -280,6 +363,14 @@ CREDEOF
 }
 
 build_cred_opts() {
+    if [[ "$PROTOCOL" == "nfs" ]]; then
+        build_nfs_opts
+    else
+        build_smb_opts
+    fi
+}
+
+build_smb_opts() {
     local opts=""
     if [ -n "$NAS_USER" ]; then
         # Use temp credentials file instead of passing password on command line
@@ -293,7 +384,32 @@ build_cred_opts() {
     # Map ownership to the invoking user (SUDO_UID/GID if run via sudo, else current user)
     local mount_uid=${SUDO_UID:-$(id -u)}
     local mount_gid=${SUDO_GID:-$(id -g)}
-    opts="$opts,uid=$mount_uid,gid=$mount_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,rsize=$RSIZE,wsize=$WSIZE,max_credits=$MAX_CREDITS,$MOUNT_OPTS"
+    local extra_opts="${MOUNT_OPTS:-iocharset=utf8,file_mode=0775,dir_mode=0775,nofail}"
+    opts="$opts,uid=$mount_uid,gid=$mount_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,rsize=$RSIZE,wsize=$WSIZE,max_credits=$MAX_CREDITS,$extra_opts"
+    echo "$opts"
+}
+
+build_nfs_opts() {
+    local opts="vers=$NFS_VERSION,rsize=$RSIZE,wsize=$WSIZE,actimeo=$CACHE_TIME,hard,intr,timeo=$NFS_TIMEO,retrans=$NFS_RETRANS"
+    # nconnect is only supported on NFSv4.1+ and Linux 5.3+ — only add if > 0
+    if [ "$NFS_NCONNECT" -gt 0 ] 2>/dev/null; then
+        opts="$opts,nconnect=$NFS_NCONNECT"
+    fi
+    local extra_opts="${MOUNT_OPTS:-nofail}"
+    if [ -n "$extra_opts" ]; then
+        opts="$opts,$extra_opts"
+    fi
+    echo "$opts"
+}
+
+# Build the NFS-specific fstab options string (reused by generate_fstab and install_fstab)
+build_nfs_fstab_opts() {
+    local extra_opts="${MOUNT_OPTS:-nofail}"
+    local opts="vers=$NFS_VERSION,rsize=$RSIZE,wsize=$WSIZE,actimeo=$CACHE_TIME,hard,intr,timeo=$NFS_TIMEO,retrans=$NFS_RETRANS"
+    if [ "$NFS_NCONNECT" -gt 0 ] 2>/dev/null; then
+        opts="$opts,nconnect=$NFS_NCONNECT"
+    fi
+    opts="$opts,$extra_opts,noauto,x-systemd.automount,x-systemd.idle-timeout=60"
     echo "$opts"
 }
 
@@ -340,6 +456,60 @@ parse_mount_error() {
 discover_shares() {
     if ! check_nas; then return 1; fi
 
+    if [[ "$PROTOCOL" == "nfs" ]]; then
+        discover_nfs_shares
+    else
+        discover_smb_shares
+    fi
+}
+
+discover_nfs_shares() {
+    if ! command -v showmount &>/dev/null; then
+        echo -e "${YELLOW}showmount not installed. Install with: sudo apt install nfs-common${NC}"
+        return 1
+    fi
+
+    echo "Discovering NFS exports on $NAS_IP..."
+    local output
+    output=$(timeout "$TIMEOUT" showmount -e "$NAS_IP" 2>&1)
+    local rc=$?
+
+    if [ $rc -ne 0 ]; then
+        echo -e "${RED}Failed to query NFS exports. Raw output:${NC}"
+        echo "$output" | head -20
+        return 1
+    fi
+
+    # Parse showmount output (skip header line)
+    # Format: /export/path  client-list
+    local share_list
+    share_list=$(echo "$output" | tail -n +2 | awk '{print $1}' | sed 's|^/||')
+
+    if [ -n "$share_list" ]; then
+        echo ""
+        echo -e "${BOLD}Available NFS exports:${NC}"
+        while IFS= read -r line; do
+            local export_path allowed_hosts
+            export_path=$(echo "$line" | awk '{print $1}')
+            allowed_hosts=$(echo "$line" | awk '{$1=""; print $0}' | xargs)
+            local sname
+            sname=$(echo "$export_path" | sed 's|^/||')
+            if is_in_fstab "$NAS_IP" "$sname"; then
+                echo -e "  ${CYAN}•${NC} $export_path  ${YELLOW}(fstab)${NC}  — allowed: $allowed_hosts"
+            else
+                echo -e "  ${CYAN}•${NC} $export_path  — allowed: $allowed_hosts"
+            fi
+        done <<< "$(echo "$output" | tail -n +2)"
+        echo ""
+        DISCOVERED_SHARES="$share_list"
+        return 0
+    else
+        echo -e "${RED}No NFS exports found.${NC}"
+        return 1
+    fi
+}
+
+discover_smb_shares() {
     if ! command -v smbclient &>/dev/null; then
         echo -e "${YELLOW}smbclient not installed. Install with: sudo apt install smbclient${NC}"
         return 1
@@ -347,7 +517,7 @@ discover_shares() {
 
     get_credentials
 
-    echo "Discovering shares on $NAS_IP..."
+    echo "Discovering SMB shares on $NAS_IP..."
     local output
     if [ -n "$NAS_USER" ]; then
         # Use authentication file for smbclient to avoid password in process list
@@ -407,7 +577,10 @@ mount_all() {
         return 1
     fi
 
-    get_credentials
+    # NFS uses host-based auth, no credentials needed
+    if [[ "$PROTOCOL" == "smb" ]]; then
+        get_credentials
+    fi
 
     # Get share list
     local share_list
@@ -462,22 +635,31 @@ mount_all() {
         # Check if this share is managed by fstab
         if is_in_fstab "$NAS_IP" "$share"; then
             local fstab_mp
-            fstab_mp=$(echo "$fstab_entries" | grep -E "//$NAS_IP/$share[[:space:]]" | awk '{print $2}' | head -1)
+            local fstab_pattern
+            if [[ "$PROTOCOL" == "nfs" ]]; then
+                fstab_pattern="$NAS_IP:/$share[[:space:]]"
+            else
+                fstab_pattern="//$NAS_IP/$share[[:space:]]"
+            fi
+            fstab_mp=$(echo "$fstab_entries" | grep -E "$fstab_pattern" | awk '{print $2}' | head -1)
             echo -e "  ${YELLOW}⊘ $share — managed by fstab (mount point: ${fstab_mp:-$mp})${NC}"
             echo -e "    ${CYAN}Use 'sudo mount $fstab_mp' or just 'cd $fstab_mp' if using automount${NC}"
             ((skipped++))
             continue
         fi
 
+        local src
+        src=$(share_source "$NAS_IP" "$share")
+
         if $DRY_RUN; then
-            echo -e "  ${CYAN}[dry-run]${NC} Would mount //$NAS_IP/$share → $mp"
+            echo -e "  ${CYAN}[dry-run]${NC} Would mount $src → $mp"
             ((mounted++))
             continue
         fi
 
         mkdir -p "$mp"
 
-        echo -n "  Mounting //$NAS_IP/$share → $mp ... "
+        echo -n "  Mounting $src → $mp ... "
 
         if mountpoint -q "$mp" 2>/dev/null; then
             echo -e "${YELLOW}already mounted${NC}"
@@ -485,8 +667,10 @@ mount_all() {
             continue
         fi
 
+        local mount_type
+        mount_type=$(fstab_fstype)
         local mount_output
-        mount_output=$(sudo timeout "$TIMEOUT" mount -t cifs "//$NAS_IP/$share" "$mp" -o "$cred_opts" 2>&1)
+        mount_output=$(sudo timeout "$TIMEOUT" mount -t "$mount_type" "$src" "$mp" -o "$cred_opts" 2>&1)
         local exit_code=$?
 
         if [ $exit_code -eq 0 ]; then
@@ -566,6 +750,7 @@ show_status() {
     echo -e "${BOLD}NAS Mount Status${NC}"
     echo "═══════════════════════════════════════"
     echo -e "  NAS IP:      ${CYAN}$NAS_IP${NC}"
+    echo -e "  Protocol:    ${CYAN}${PROTOCOL^^}${NC}"
     echo -e "  Mount base:  ${CYAN}$MOUNT_BASE${NC}"
     echo -e "  Config:      ${CYAN}${CONFIG_FILE}${NC}"
     if [ -f "$CONFIG_FILE" ]; then
@@ -609,7 +794,10 @@ show_status() {
 }
 
 generate_fstab() {
-    get_credentials
+    # NFS uses host-based auth, no credentials needed
+    if [[ "$PROTOCOL" == "smb" ]]; then
+        get_credentials
+    fi
 
     local share_list
     if [ -n "$SHARES" ]; then
@@ -650,7 +838,19 @@ generate_fstab() {
             continue
         fi
         local mp="$MOUNT_BASE/$share"
-        echo "//$NAS_IP/$share  $mp  cifs  credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,rsize=$RSIZE,wsize=$WSIZE,max_credits=$MAX_CREDITS,$MOUNT_OPTS,noauto,x-systemd.automount,x-systemd.idle-timeout=60  0  0"
+        local src
+        src=$(share_source "$NAS_IP" "$share")
+        local fstype
+        fstype=$(fstab_fstype)
+        local extra_opts="${MOUNT_OPTS:-nofail}"
+        if [[ "$PROTOCOL" == "nfs" ]]; then
+            local nfs_opts
+            nfs_opts=$(build_nfs_fstab_opts)
+            echo "$src  $mp  $fstype  $nfs_opts  0  0"
+        else
+            local smb_extra="${MOUNT_OPTS:-iocharset=utf8,file_mode=0775,dir_mode=0775,nofail}"
+            echo "$src  $mp  $fstype  credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,rsize=$RSIZE,wsize=$WSIZE,max_credits=$MAX_CREDITS,$smb_extra,noauto,x-systemd.automount,x-systemd.idle-timeout=60  0  0"
+        fi
     done <<< "$share_list"
 
     [ $excluded_count -gt 0 ] && echo -e "\n${YELLOW}($excluded_count excluded share(s) omitted)${NC}"
@@ -660,14 +860,18 @@ generate_fstab() {
     echo ""
     echo -e "${BOLD}To install:${NC}"
     echo ""
-    echo "  1. Create credentials file:"
-    echo -e "     ${CYAN}sudo tee $cred_file <<EOF"
-    echo "username=${NAS_USER:-your_username}"
-    echo "password=${NAS_PASS:-your_password}"
-    echo -e "EOF${NC}"
-    echo -e "     ${CYAN}sudo chmod 600 $cred_file${NC}"
-    echo ""
-    echo "  2. Create mount points:"
+    if [[ "$PROTOCOL" == "smb" ]]; then
+        echo "  1. Create credentials file:"
+        echo -e "     ${CYAN}sudo tee $cred_file <<EOF"
+        echo "username=${NAS_USER:-your_username}"
+        echo "password=${NAS_PASS:-your_password}"
+        echo -e "EOF${NC}"
+        echo -e "     ${CYAN}sudo chmod 600 $cred_file${NC}"
+        echo ""
+        echo "  2. Create mount points:"
+    else
+        echo "  1. Create mount points:"
+    fi
     while IFS= read -r share; do
         share=$(echo "$share" | xargs)
         [ -z "$share" ] && continue
@@ -724,10 +928,14 @@ install_fstab() {
         local test_mp
         test_mp=$(mktemp -d "/tmp/nas-test-mount.XXXXXX")
 
-        echo -n "  Testing //$NAS_IP/$share ... "
+        echo -n "  Testing $(share_source "$NAS_IP" "$share") ... "
 
+        local mount_type
+        mount_type=$(fstab_fstype)
+        local src
+        src=$(share_source "$NAS_IP" "$share")
         local mount_output
-        mount_output=$(sudo timeout "$TIMEOUT" mount -t cifs "//$NAS_IP/$share" "$test_mp" -o "$cred_opts" 2>&1)
+        mount_output=$(sudo timeout "$TIMEOUT" mount -t "$mount_type" "$src" "$test_mp" -o "$cred_opts" 2>&1)
         local exit_code=$?
 
         if [ $exit_code -eq 0 ]; then
@@ -772,14 +980,16 @@ install_fstab() {
 
     echo ""
 
-    # ── Create credential file ───────────────────────────────────────────
-    echo -e "Creating credentials file at ${CYAN}$cred_file${NC}..."
-    sudo tee "$cred_file" > /dev/null <<EOF
+    # ── Create credential file (SMB only) ────────────────────────────────
+    if [[ "$PROTOCOL" == "smb" ]]; then
+        echo -e "Creating credentials file at ${CYAN}$cred_file${NC}..."
+        sudo tee "$cred_file" > /dev/null <<EOF
 username=${NAS_USER:-guest}
 password=${NAS_PASS:-}
 EOF
-    sudo chmod 600 "$cred_file"
-    echo -e "${GREEN}✓ Credentials file created${NC}"
+        sudo chmod 600 "$cred_file"
+        echo -e "${GREEN}✓ Credentials file created${NC}"
+    fi
 
     # Create mount points (owned by the invoking user, not root)
     local mount_uid=${SUDO_UID:-$(id -u)}
@@ -807,9 +1017,22 @@ EOF
         share=$(echo "$share" | xargs)
         [ -z "$share" ] && continue
         local mp="$MOUNT_BASE/$share"
-        local entry="//$NAS_IP/$share  $mp  cifs  credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,rsize=$RSIZE,wsize=$WSIZE,max_credits=$MAX_CREDITS,$MOUNT_OPTS,noauto,x-systemd.automount,x-systemd.idle-timeout=60  0  0"
+        local src
+        src=$(share_source "$NAS_IP" "$share")
+        local fstype
+        fstype=$(fstab_fstype)
+        local entry
+        local extra_opts="${MOUNT_OPTS:-nofail}"
+        if [[ "$PROTOCOL" == "nfs" ]]; then
+            local nfs_opts
+            nfs_opts=$(build_nfs_fstab_opts)
+            entry="$src  $mp  $fstype  $nfs_opts  0  0"
+        else
+            local smb_extra="${MOUNT_OPTS:-iocharset=utf8,file_mode=0775,dir_mode=0775,nofail}"
+            entry="$src  $mp  $fstype  credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,rsize=$RSIZE,wsize=$WSIZE,max_credits=$MAX_CREDITS,$smb_extra,noauto,x-systemd.automount,x-systemd.idle-timeout=60  0  0"
+        fi
 
-        if grep -qE "//$NAS_IP/$share[[:space:]]" /etc/fstab 2>/dev/null; then
+        if is_in_fstab "$NAS_IP" "$share"; then
             echo -e "${YELLOW}⊘ $share already in fstab — skipped${NC}"
         else
             echo "$entry" | sudo tee -a /etc/fstab >/dev/null
@@ -827,6 +1050,253 @@ EOF
     echo -e "${GREEN}Done! Shares will auto-mount on access at $MOUNT_BASE/${NC}"
 }
 
+# ── Interactive Setup Wizard ─────────────────────────────────────────────────
+
+interactive_setup() {
+    echo -e "${BOLD}╔════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}║       NAS Mount Manager — Setup        ║${NC}"
+    echo -e "${BOLD}╚════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # ── Step 1: NAS IP ───────────────────────────────────────────────────
+    echo -e "${BOLD}Step 1: NAS Address${NC}"
+    echo -n "  NAS IP address [$NAS_IP]: "
+    read -r input_ip
+    NAS_IP="${input_ip:-$NAS_IP}"
+    echo ""
+
+    # Quick check
+    if ! check_nas; then
+        echo ""
+        echo -n "NAS is unreachable. Continue anyway? (y/N): "
+        read -r cont
+        if [[ ! "$cont" =~ ^[Yy] ]]; then
+            echo "Aborted."
+            return 1
+        fi
+    fi
+    echo ""
+
+    # ── Step 2: Protocol ─────────────────────────────────────────────────
+    echo -e "${BOLD}Step 2: Protocol${NC}"
+    echo "  1) SMB/CIFS — Windows/Samba shares (username + password)"
+    echo "  2) NFS      — Linux/Unix exports (host-based auth, no password)"
+    echo -n "  Choose [1]: "
+    read -r proto_choice
+    case "${proto_choice:-1}" in
+        2|nfs|NFS)  PROTOCOL="nfs" ;;
+        *)          PROTOCOL="smb" ;;
+    esac
+    echo -e "  → Protocol: ${CYAN}${PROTOCOL^^}${NC}"
+    echo ""
+
+    # ── Step 3: Credentials (SMB only) ───────────────────────────────────
+    if [[ "$PROTOCOL" == "smb" ]]; then
+        echo -e "${BOLD}Step 3: Credentials${NC}"
+        if [ -z "$NAS_USER" ]; then
+            echo -n "  SMB username (Enter for guest): "
+            read -r NAS_USER
+        else
+            echo -e "  Username: ${CYAN}$NAS_USER${NC} (from config/env)"
+            echo -n "  Change username? (Enter to keep, or type new): "
+            read -r new_user
+            [ -n "$new_user" ] && NAS_USER="$new_user"
+        fi
+
+        if [ -n "$NAS_USER" ] && [ -z "$NAS_PASS" ]; then
+            # Try keyring
+            local keyring_pass
+            keyring_pass=$(keyring_lookup "$NAS_IP" "$NAS_USER" 2>/dev/null)
+            if [ -n "$keyring_pass" ]; then
+                NAS_PASS="$keyring_pass"
+                echo -e "  ${GREEN}✓ Password retrieved from keyring${NC}"
+            else
+                echo -n "  Password for $NAS_USER: "
+                read -rs NAS_PASS
+                echo ""
+            fi
+        fi
+        echo ""
+    else
+        echo -e "${BOLD}Step 3: Credentials${NC}"
+        echo -e "  ${CYAN}NFS uses host-based auth — no credentials needed.${NC}"
+        echo ""
+    fi
+
+    # ── Step 4: Discover shares ──────────────────────────────────────────
+    echo -e "${BOLD}Step 4: Discover Shares${NC}"
+    echo ""
+    local share_list=""
+    if discover_shares; then
+        share_list="$DISCOVERED_SHARES"
+    else
+        echo ""
+        echo -n "  Enter share names manually (comma-separated): "
+        read -r manual_shares
+        share_list=$(echo "$manual_shares" | tr ',' '\n')
+    fi
+
+    if [ -z "$share_list" ]; then
+        echo -e "${RED}No shares found or entered. Aborting.${NC}"
+        return 1
+    fi
+
+    # ── Step 5: Select shares ────────────────────────────────────────────
+    echo -e "${BOLD}Step 5: Select Shares to Mount${NC}"
+    echo ""
+
+    # Number each share for selection
+    local share_array=()
+    local i=1
+    while IFS= read -r s; do
+        s=$(echo "$s" | xargs)
+        [ -z "$s" ] && continue
+        share_array+=("$s")
+        echo -e "  ${CYAN}$i)${NC} $s"
+        ((i++))
+    done <<< "$share_list"
+    echo -e "  ${CYAN}A)${NC} All of the above"
+    echo ""
+
+    echo -n "  Enter choices (e.g. 1,3,5 or A for all) [A]: "
+    read -r selection
+
+    local selected_shares=""
+    if [[ -z "$selection" || "$selection" =~ ^[Aa] ]]; then
+        selected_shares="$share_list"
+        echo -e "  → Mounting ${GREEN}all${NC} shares"
+    else
+        IFS=',' read -ra picks <<< "$selection"
+        for pick in "${picks[@]}"; do
+            pick=$(echo "$pick" | xargs)
+            if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le ${#share_array[@]} ]; then
+                local idx=$((pick - 1))
+                if [ -n "$selected_shares" ]; then
+                    selected_shares="$selected_shares"$'\n'"${share_array[$idx]}"
+                else
+                    selected_shares="${share_array[$idx]}"
+                fi
+            else
+                echo -e "  ${YELLOW}Skipping invalid selection: $pick${NC}"
+            fi
+        done
+        if [ -z "$selected_shares" ]; then
+            echo -e "${RED}No valid shares selected. Aborting.${NC}"
+            return 1
+        fi
+        echo -e "  → Selected: ${CYAN}$(echo "$selected_shares" | tr '\n' ',' | sed 's/,$//')${NC}"
+    fi
+    echo ""
+
+    # ── Step 6: Mount path ───────────────────────────────────────────────
+    echo -e "${BOLD}Step 6: Mount Location${NC}"
+    echo -n "  Mount base path [$MOUNT_BASE]: "
+    read -r input_mount
+    MOUNT_BASE="${input_mount:-$MOUNT_BASE}"
+    echo ""
+
+    # ── Step 7: Confirm and mount ────────────────────────────────────────
+    echo -e "${BOLD}Summary${NC}"
+    echo "═══════════════════════════════════════"
+    echo -e "  NAS IP:      ${CYAN}$NAS_IP${NC}"
+    echo -e "  Protocol:    ${CYAN}${PROTOCOL^^}${NC}"
+    if [[ "$PROTOCOL" == "smb" ]]; then
+        echo -e "  Username:    ${CYAN}${NAS_USER:-guest}${NC}"
+    fi
+    echo -e "  Mount base:  ${CYAN}$MOUNT_BASE${NC}"
+    echo -e "  Shares:      ${CYAN}$(echo "$selected_shares" | tr '\n' ',' | sed 's/,$//')${NC}"
+    echo ""
+
+    echo -n "Proceed with mounting? (Y/n): "
+    read -r confirm
+    if [[ "$confirm" =~ ^[Nn] ]]; then
+        echo "Aborted."
+        return 0
+    fi
+    echo ""
+
+    # Override SHARES so mount_all uses our selection
+    SHARES=$(echo "$selected_shares" | tr '\n' ',' | sed 's/,$//')
+    mount_all
+
+    echo ""
+
+    # ── Optional: Save config ────────────────────────────────────────────
+    echo -n "Save these settings to config file for next time? (y/N): "
+    read -r save_config
+    if [[ "$save_config" =~ ^[Yy] ]]; then
+        # Write a simple config (re-use generate_config logic inline)
+        local save_pass_to_config=true
+        if [[ "$PROTOCOL" == "smb" ]] && has_keyring && [ -n "$NAS_USER" ] && [ -n "$NAS_PASS" ]; then
+            echo ""
+            echo "Password storage:"
+            echo "  1) System keyring (encrypted)"
+            echo "  2) Config file (plaintext, chmod 600)"
+            echo -n "  Choose [1]: "
+            read -r storage_choice
+            if [[ "${storage_choice:-1}" == "1" ]]; then
+                if keyring_store "$NAS_IP" "$NAS_USER" "$NAS_PASS"; then
+                    echo -e "${GREEN}✓ Password saved to keyring${NC}"
+                    save_pass_to_config=false
+                fi
+            fi
+        fi
+
+        if [[ "$PROTOCOL" == "nfs" ]]; then
+            cat > "$CONFIG_FILE" <<EOF
+# NAS Mount Configuration — saved by setup wizard
+# Generated on $(date)
+PROTOCOL="$PROTOCOL"
+NAS_IP="$NAS_IP"
+MOUNT_BASE="$MOUNT_BASE"
+NFS_VERSION="$NFS_VERSION"
+SHARES="$SHARES"
+CACHE_TIME="$CACHE_TIME"
+RSIZE="$RSIZE"
+WSIZE="$WSIZE"
+NFS_NCONNECT="$NFS_NCONNECT"
+NFS_TIMEO="$NFS_TIMEO"
+NFS_RETRANS="$NFS_RETRANS"
+EOF
+        elif $save_pass_to_config; then
+            cat > "$CONFIG_FILE" <<EOF
+# NAS Mount Configuration — saved by setup wizard
+# Generated on $(date)
+PROTOCOL="$PROTOCOL"
+NAS_IP="$NAS_IP"
+NAS_USER="$NAS_USER"
+NAS_PASS="$NAS_PASS"
+MOUNT_BASE="$MOUNT_BASE"
+SMB_VERSION="$SMB_VERSION"
+SHARES="$SHARES"
+CACHE_TIME="$CACHE_TIME"
+RSIZE="$RSIZE"
+WSIZE="$WSIZE"
+MAX_CREDITS="$MAX_CREDITS"
+EOF
+        else
+            cat > "$CONFIG_FILE" <<EOF
+# NAS Mount Configuration — saved by setup wizard
+# Generated on $(date)
+# Password stored in system keyring
+PROTOCOL="$PROTOCOL"
+NAS_IP="$NAS_IP"
+NAS_USER="$NAS_USER"
+MOUNT_BASE="$MOUNT_BASE"
+SMB_VERSION="$SMB_VERSION"
+SHARES="$SHARES"
+CACHE_TIME="$CACHE_TIME"
+RSIZE="$RSIZE"
+WSIZE="$WSIZE"
+MAX_CREDITS="$MAX_CREDITS"
+EOF
+        fi
+        chmod 600 "$CONFIG_FILE"
+        echo -e "${GREEN}✓ Config saved to $CONFIG_FILE${NC}"
+        echo -e "  Next time just run: ${CYAN}$(basename "$0") mount${NC}"
+    fi
+}
+
 generate_config() {
     echo -e "${BOLD}NAS Config Generator${NC}"
     echo ""
@@ -835,23 +1305,41 @@ generate_config() {
     read -r input_ip
     local cfg_ip="${input_ip:-$NAS_IP}"
 
-    echo -n "NAS username (Enter for guest): "
-    read -r cfg_user
+    echo -n "Protocol (smb/nfs) [$PROTOCOL]: "
+    read -r input_proto
+    local cfg_proto="${input_proto:-$PROTOCOL}"
+    case "$cfg_proto" in
+        smb|nfs) ;;
+        *) echo -e "${RED}Invalid protocol '$cfg_proto'. Must be 'smb' or 'nfs'.${NC}"; return 1 ;;
+    esac
 
-    local cfg_pass=""
-    if [ -n "$cfg_user" ]; then
-        echo -n "NAS password: "
-        read -rs cfg_pass
-        echo ""
+    local cfg_user="" cfg_pass=""
+    if [[ "$cfg_proto" == "smb" ]]; then
+        echo -n "NAS username (Enter for guest): "
+        read -r cfg_user
+
+        if [ -n "$cfg_user" ]; then
+            echo -n "NAS password: "
+            read -rs cfg_pass
+            echo ""
+        fi
     fi
 
     echo -n "Mount base path [$MOUNT_BASE]: "
     read -r input_mount
     local cfg_mount="${input_mount:-$MOUNT_BASE}"
 
-    echo -n "SMB version [$SMB_VERSION]: "
-    read -r input_smb
-    local cfg_smb="${input_smb:-$SMB_VERSION}"
+    local cfg_smb="$SMB_VERSION"
+    local cfg_nfs="$NFS_VERSION"
+    if [[ "$cfg_proto" == "smb" ]]; then
+        echo -n "SMB version [$SMB_VERSION]: "
+        read -r input_smb
+        cfg_smb="${input_smb:-$SMB_VERSION}"
+    else
+        echo -n "NFS version [$NFS_VERSION]: "
+        read -r input_nfs
+        cfg_nfs="${input_nfs:-$NFS_VERSION}"
+    fi
 
     echo -n "Shares (comma-separated, or Enter to auto-discover): "
     read -r cfg_shares
@@ -871,13 +1359,31 @@ generate_config() {
     read -r input_wsize
     local cfg_wsize="${input_wsize:-$WSIZE}"
 
-    echo -n "SMB3 max credits [$MAX_CREDITS] (higher = more parallel requests): "
-    read -r input_credits
-    local cfg_credits="${input_credits:-$MAX_CREDITS}"
+    local cfg_credits="$MAX_CREDITS"
+    local cfg_nconnect="$NFS_NCONNECT"
+    local cfg_timeo="$NFS_TIMEO"
+    local cfg_retrans="$NFS_RETRANS"
+    if [[ "$cfg_proto" == "smb" ]]; then
+        echo -n "SMB3 max credits [$MAX_CREDITS] (higher = more parallel requests): "
+        read -r input_credits
+        cfg_credits="${input_credits:-$MAX_CREDITS}"
+    else
+        echo -n "NFS nconnect [$NFS_NCONNECT] (0=disabled, 2-16 for multi-channel I/O): "
+        read -r input_nconnect
+        cfg_nconnect="${input_nconnect:-$NFS_NCONNECT}"
 
-    # Decide where to store the password
+        echo -n "NFS timeo in deciseconds [$NFS_TIMEO] (150 = 15s initial timeout): "
+        read -r input_timeo
+        cfg_timeo="${input_timeo:-$NFS_TIMEO}"
+
+        echo -n "NFS retrans [$NFS_RETRANS] (retransmission count before failure): "
+        read -r input_retrans
+        cfg_retrans="${input_retrans:-$NFS_RETRANS}"
+    fi
+
+    # Decide where to store the password (SMB only)
     local save_pass_to_config=true
-    if has_keyring && [ -n "$cfg_user" ] && [ -n "$cfg_pass" ]; then
+    if [[ "$cfg_proto" == "smb" ]] && has_keyring && [ -n "$cfg_user" ] && [ -n "$cfg_pass" ]; then
         echo ""
         echo "Password storage options:"
         echo "  1) System keyring (recommended — encrypted, no plaintext on disk)"
@@ -894,11 +1400,33 @@ generate_config() {
         fi
     fi
 
-    if $save_pass_to_config; then
+    if [[ "$cfg_proto" == "nfs" ]]; then
         cat > "$CONFIG_FILE" <<EOF
 # NAS Mount Configuration
 # Generated on $(date)
 
+PROTOCOL="$cfg_proto"
+NAS_IP="$cfg_ip"
+MOUNT_BASE="$cfg_mount"
+NFS_VERSION="$cfg_nfs"
+SHARES="$cfg_shares"
+EXCLUDE_SHARES="$cfg_exclude"
+CACHE_TIME="$cfg_cache"
+RSIZE="$cfg_rsize"
+WSIZE="$cfg_wsize"
+NFS_NCONNECT="$cfg_nconnect"
+NFS_TIMEO="$cfg_timeo"
+NFS_RETRANS="$cfg_retrans"
+
+# Additional mount options (comma-separated)
+# MOUNT_OPTS="nofail"
+EOF
+    elif $save_pass_to_config; then
+        cat > "$CONFIG_FILE" <<EOF
+# NAS Mount Configuration
+# Generated on $(date)
+
+PROTOCOL="$cfg_proto"
 NAS_IP="$cfg_ip"
 NAS_USER="$cfg_user"
 NAS_PASS="$cfg_pass"
@@ -920,6 +1448,7 @@ EOF
 # Generated on $(date)
 # Password is stored in the system keyring (secret-tool)
 
+PROTOCOL="$cfg_proto"
 NAS_IP="$cfg_ip"
 NAS_USER="$cfg_user"
 MOUNT_BASE="$cfg_mount"
@@ -938,7 +1467,7 @@ EOF
 
     echo ""
     echo -e "${GREEN}✓ Config saved to $CONFIG_FILE${NC}"
-    if $save_pass_to_config && [ -n "$cfg_pass" ]; then
+    if [[ "$cfg_proto" == "smb" ]] && $save_pass_to_config && [ -n "$cfg_pass" ]; then
         echo -e "${YELLOW}Note: Config file contains your password in plain text.${NC}"
         echo -e "${YELLOW}      Consider: sudo apt install libsecret-tools${NC}"
         echo -e "${YELLOW}      Then re-run 'config' to use the system keyring instead.${NC}"
@@ -963,12 +1492,17 @@ POSITIONAL=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -i|--ip)        NAS_IP="$2";       shift 2 ;;
+        --protocol)     PROTOCOL="$2";     shift 2 ;;
         -u|--user)      NAS_USER="$2";     shift 2 ;;
         -p|--pass)      NAS_PASS="$2";     shift 2 ;;
         -m|--mount)     MOUNT_BASE="$2";   shift 2 ;;
         -s|--shares)    SHARES="$2";       shift 2 ;;
         -e|--exclude)   EXCLUDE_SHARES="$2"; shift 2 ;;
         --smb-version)  SMB_VERSION="$2";  shift 2 ;;
+        --nfs-version)  NFS_VERSION="$2";  shift 2 ;;
+        --nfs-nconnect) NFS_NCONNECT="$2";  shift 2 ;;
+        --nfs-timeo)    NFS_TIMEO="$2";    shift 2 ;;
+        --nfs-retrans)  NFS_RETRANS="$2";  shift 2 ;;
         --timeout|-t)   TIMEOUT="$2";      shift 2 ;;
         --cache-time)   CACHE_TIME="$2";     shift 2 ;;
         --rsize)        RSIZE="$2";          shift 2 ;;
@@ -987,7 +1521,8 @@ done
 # First positional arg is the command
 COMMAND="${POSITIONAL[0]:-}"
 
-# Validate numeric inputs
+# Validate inputs
+validate_protocol
 validate_positive_int "--timeout"     "$TIMEOUT"
 validate_positive_int "--cache-time"  "$CACHE_TIME"
 validate_positive_int "--rsize"       "$RSIZE"
@@ -1001,6 +1536,7 @@ case "${COMMAND:-}" in
     status|s)         show_status ;;
     discover|d)       discover_shares ;;
     fstab|f)          generate_fstab ;;
+    setup|wizard|w)   interactive_setup ;;
     config|c)         generate_config ;;
     *)                usage ;;
 esac
