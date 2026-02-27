@@ -149,6 +149,373 @@ show_fstab_status() {
     return 1
 }
 
+# ── Fstab Management ────────────────────────────────────────────────────────
+
+# Get ALL fstab entries for the NAS IP (both protocols), one per line
+# Returns raw fstab lines. Includes comment-preceded entries if they match.
+get_all_nas_fstab_entries() {
+    local ip="$1"
+    grep -n "^[^#].*${ip}[:/]" /etc/fstab 2>/dev/null || true
+}
+
+# List fstab entries for the NAS with numbered display
+fstab_list() {
+    local ip="$NAS_IP"
+    local entries
+    entries=$(get_all_nas_fstab_entries "$ip")
+
+    if [ -z "$entries" ]; then
+        echo -e "  ${YELLOW}No fstab entries found for $ip${NC}"
+        return 1
+    fi
+
+    echo -e "  ${BOLD}Fstab entries for $ip:${NC}"
+    echo ""
+    local idx=0
+    while IFS= read -r raw_line; do
+        ((idx++))
+        local lineno="${raw_line%%:*}"
+        local line="${raw_line#*:}"
+        local src mp fstype opts
+        src=$(echo "$line" | awk '{print $1}')
+        mp=$(echo "$line" | awk '{print $2}')
+        fstype=$(echo "$line" | awk '{print $3}')
+        opts=$(echo "$line" | awk '{print $4}')
+
+        # Extract share name from source
+        local share
+        if [[ "$src" == //* ]]; then
+            share=$(echo "$src" | sed "s|//$ip/||")
+        else
+            share=$(echo "$src" | sed "s|$ip:/||")
+        fi
+
+        # Detect mount mode
+        local mode="${GREEN}auto-mount${NC}"
+        if echo "$opts" | grep -q "noauto"; then
+            mode="${YELLOW}on-demand${NC}"
+        fi
+
+        echo -e "    ${CYAN}[$idx]${NC}  ${BOLD}$share${NC}"
+        echo -e "         Source:  $src"
+        echo -e "         Mount:   $mp"
+        echo -e "         Type:    $fstype"
+        echo -e "         Mode:    $mode"
+        # Show a compact view of key options
+        local key_opts=""
+        for opt in soft hard vers=* rsize=* wsize=* _netdev nofail; do
+            local match
+            match=$(echo ",$opts," | grep -oP "(?<=,)${opt}(?=,)" | head -1)
+            [ -n "$match" ] && key_opts="${key_opts:+$key_opts, }$match"
+        done
+        # Extract vers= separately since glob doesn't work in grep -oP like that
+        local vers_match
+        vers_match=$(echo ",$opts," | grep -oP '(?<=,)vers=[^,]+(?=,)' | head -1)
+        [ -n "$vers_match" ] && key_opts="${key_opts:+$key_opts, }$vers_match"
+        [ -n "$key_opts" ] && echo -e "         Options: $key_opts"
+        echo ""
+    done <<< "$entries"
+    echo -e "  Total: $idx entry/entries  (fstab lines shown above)"
+    return 0
+}
+
+# Remove selected fstab entries for the NAS
+fstab_remove() {
+    local ip="$NAS_IP"
+    local entries
+    entries=$(get_all_nas_fstab_entries "$ip")
+
+    if [ -z "$entries" ]; then
+        echo -e "${YELLOW}No fstab entries found for $ip${NC}"
+        return 0
+    fi
+
+    echo -e "${BOLD}Current fstab entries for $ip:${NC}"
+    echo ""
+    local -a line_numbers=()
+    local -a share_names=()
+    local idx=0
+    while IFS= read -r raw_line; do
+        ((idx++))
+        local lineno="${raw_line%%:*}"
+        local line="${raw_line#*:}"
+        local src mp fstype
+        src=$(echo "$line" | awk '{print $1}')
+        mp=$(echo "$line" | awk '{print $2}')
+        fstype=$(echo "$line" | awk '{print $3}')
+
+        local share
+        if [[ "$src" == //* ]]; then
+            share=$(echo "$src" | sed "s|//$ip/||")
+        else
+            share=$(echo "$src" | sed "s|$ip:/||")
+        fi
+
+        line_numbers+=("$lineno")
+        share_names+=("$share")
+        echo -e "  ${CYAN}[$idx]${NC}  $share  →  $mp  ($fstype)"
+    done <<< "$entries"
+
+    echo ""
+    echo "Enter numbers to remove (comma-separated), 'all' to remove all, or 'q' to cancel:"
+    echo -n "  > "
+    read -r selection
+
+    [[ "$selection" =~ ^[Qq] ]] && { echo "Cancelled."; return 0; }
+
+    local -a to_remove=()
+    if [[ "$selection" == "all" ]]; then
+        to_remove=("${line_numbers[@]}")
+        echo ""
+        echo -e "${YELLOW}Will remove ALL $idx fstab entries for $ip${NC}"
+    else
+        # Parse comma-separated indices
+        IFS=',' read -ra indices <<< "$selection"
+        for i in "${indices[@]}"; do
+            i=$(echo "$i" | xargs)  # trim whitespace
+            if [[ "$i" =~ ^[0-9]+$ ]] && [ "$i" -ge 1 ] && [ "$i" -le "$idx" ]; then
+                to_remove+=("${line_numbers[$((i-1))]}")
+                echo -e "  Will remove: ${BOLD}${share_names[$((i-1))]}${NC} (fstab line ${line_numbers[$((i-1))]})"
+            else
+                echo -e "  ${RED}Invalid selection: $i (skipping)${NC}"
+            fi
+        done
+    fi
+
+    if [ ${#to_remove[@]} -eq 0 ]; then
+        echo -e "${YELLOW}Nothing selected to remove.${NC}"
+        return 0
+    fi
+
+    echo ""
+    echo -n "Confirm removal of ${#to_remove[@]} entry/entries? (y/N): "
+    read -r confirm
+    if [[ ! "$confirm" =~ ^[Yy] ]]; then
+        echo "Cancelled."
+        return 0
+    fi
+
+    # Backup fstab
+    sudo cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
+    echo -e "${GREEN}✓ Backed up /etc/fstab${NC}"
+
+    # Remove lines by line number (process in reverse order to keep line numbers stable)
+    IFS=$'\n' read -ra sorted < <(printf '%s\n' "${to_remove[@]}" | sort -rn)
+    for lineno in "${sorted[@]}"; do
+        sudo sed -i "${lineno}d" /etc/fstab
+    done
+    echo -e "${GREEN}✓ Removed ${#to_remove[@]} fstab entry/entries${NC}"
+
+    # Also remove associated .automount and .mount units from systemd
+    sudo systemctl daemon-reload
+    echo -e "${GREEN}✓ systemd reloaded${NC}"
+
+    # Offer to unmount the removed shares
+    echo ""
+    echo -n "Unmount the removed shares now? (y/N): "
+    read -r do_unmount
+    if [[ "$do_unmount" =~ ^[Yy] ]]; then
+        for i in "${!to_remove[@]}"; do
+            # Find the share name — we stored indices earlier, map back
+            for j in "${!line_numbers[@]}"; do
+                if [[ "${line_numbers[$j]}" == "${to_remove[$i]}" ]]; then
+                    local share="${share_names[$j]}"
+                    local mp="$MOUNT_BASE/$share"
+                    if mountpoint -q "$mp" 2>/dev/null; then
+                        sudo umount "$mp" 2>/dev/null && \
+                            echo -e "  ${GREEN}✓ Unmounted $share${NC}" || \
+                            echo -e "  ${YELLOW}⊘ Could not unmount $share (may be busy)${NC}"
+                    fi
+                    # Stop the automount unit if it exists
+                    local unit_name
+                    unit_name=$(systemd-escape -p "$mp").automount
+                    sudo systemctl stop "$unit_name" 2>/dev/null || true
+                fi
+            done
+        done
+    fi
+
+    echo ""
+    echo -e "${GREEN}Done.${NC} Run '$(basename "$0") status' to verify."
+}
+
+# Edit options on an existing fstab entry
+fstab_edit() {
+    local ip="$NAS_IP"
+    local entries
+    entries=$(get_all_nas_fstab_entries "$ip")
+
+    if [ -z "$entries" ]; then
+        echo -e "${YELLOW}No fstab entries found for $ip${NC}"
+        return 0
+    fi
+
+    echo -e "${BOLD}Fstab entries for $ip:${NC}"
+    echo ""
+    local -a line_numbers=()
+    local -a share_names=()
+    local -a entry_lines=()
+    local idx=0
+    while IFS= read -r raw_line; do
+        ((idx++))
+        local lineno="${raw_line%%:*}"
+        local line="${raw_line#*:}"
+        local src mp fstype opts
+        src=$(echo "$line" | awk '{print $1}')
+        mp=$(echo "$line" | awk '{print $2}')
+        fstype=$(echo "$line" | awk '{print $3}')
+        opts=$(echo "$line" | awk '{print $4}')
+
+        local share
+        if [[ "$src" == //* ]]; then
+            share=$(echo "$src" | sed "s|//$ip/||")
+        else
+            share=$(echo "$src" | sed "s|$ip:/||")
+        fi
+
+        line_numbers+=("$lineno")
+        share_names+=("$share")
+        entry_lines+=("$line")
+        echo -e "  ${CYAN}[$idx]${NC}  $share  ($fstype)"
+        echo -e "        Options: $opts"
+        echo ""
+    done <<< "$entries"
+
+    echo "Select entry to edit (1-$idx), or 'q' to cancel:"
+    echo -n "  > "
+    read -r selection
+
+    [[ "$selection" =~ ^[Qq] ]] && { echo "Cancelled."; return 0; }
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "$idx" ]; then
+        echo -e "${RED}Invalid selection.${NC}"
+        return 1
+    fi
+
+    local sel_idx=$((selection - 1))
+    local sel_lineno="${line_numbers[$sel_idx]}"
+    local sel_line="${entry_lines[$sel_idx]}"
+    local sel_share="${share_names[$sel_idx]}"
+    local sel_src sel_mp sel_fstype sel_opts sel_dump sel_pass
+    sel_src=$(echo "$sel_line" | awk '{print $1}')
+    sel_mp=$(echo "$sel_line" | awk '{print $2}')
+    sel_fstype=$(echo "$sel_line" | awk '{print $3}')
+    sel_opts=$(echo "$sel_line" | awk '{print $4}')
+    sel_dump=$(echo "$sel_line" | awk '{print $5}')
+    sel_pass=$(echo "$sel_line" | awk '{print $6}')
+
+    echo ""
+    echo -e "${BOLD}Editing: $sel_share${NC}"
+    echo ""
+    echo "What would you like to change?"
+    echo "  1) Mount point     (current: $sel_mp)"
+    echo "  2) Mount options   (current: $sel_opts)"
+    echo "  3) Replace with fresh defaults (regenerate from current settings)"
+    echo "  q) Cancel"
+    echo ""
+    echo -n "  > "
+    read -r edit_choice
+
+    case "$edit_choice" in
+        1)
+            echo -n "New mount point [$sel_mp]: "
+            read -r new_mp
+            new_mp="${new_mp:-$sel_mp}"
+            local new_line="$sel_src  $new_mp  $sel_fstype  $sel_opts  ${sel_dump:-0}  ${sel_pass:-0}"
+            sudo cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
+            sudo sed -i "${sel_lineno}s|.*|${new_line}|" /etc/fstab
+            sudo mkdir -p "$new_mp"
+            sudo chown "${SUDO_UID:-$(id -u)}:${SUDO_GID:-$(id -g)}" "$new_mp"
+            echo -e "${GREEN}✓ Updated mount point to $new_mp${NC}"
+            ;;
+        2)
+            echo ""
+            echo "Current options (one per line for readability):"
+            echo "$sel_opts" | tr ',' '\n' | sed 's/^/    /'
+            echo ""
+            echo "Enter new options string (comma-separated), or press Enter to keep current:"
+            echo -n "  > "
+            read -r new_opts
+            new_opts="${new_opts:-$sel_opts}"
+            local new_line="$sel_src  $sel_mp  $sel_fstype  $new_opts  ${sel_dump:-0}  ${sel_pass:-0}"
+            sudo cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
+            sudo sed -i "${sel_lineno}s|.*|${new_line}|" /etc/fstab
+            echo -e "${GREEN}✓ Updated options for $sel_share${NC}"
+            ;;
+        3)
+            local new_opts new_line
+            if [[ "$sel_fstype" == "nfs" || "$sel_fstype" == "nfs4" ]]; then
+                new_opts=$(build_nfs_fstab_opts)
+            else
+                local fstab_uid=${SUDO_UID:-$(id -u)}
+                local fstab_gid=${SUDO_GID:-$(id -g)}
+                local cred_file="/etc/nas-credentials"
+                local smb_extra="${MOUNT_OPTS:-iocharset=utf8,file_mode=0775,dir_mode=0775,nofail}"
+                new_opts="credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,rsize=$RSIZE,wsize=$WSIZE,max_credits=$MAX_CREDITS,$smb_extra,_netdev,noauto,x-systemd.automount,x-systemd.idle-timeout=60,x-systemd.mount-timeout=10"
+            fi
+            new_line="$sel_src  $sel_mp  $sel_fstype  $new_opts  0  0"
+            echo ""
+            echo "New entry:"
+            echo "  $new_line"
+            echo ""
+            echo -n "Apply? (y/N): "
+            read -r apply
+            if [[ "$apply" =~ ^[Yy] ]]; then
+                sudo cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
+                sudo sed -i "${sel_lineno}s|.*|${new_line}|" /etc/fstab
+                echo -e "${GREEN}✓ Regenerated fstab entry for $sel_share${NC}"
+            else
+                echo "Cancelled."
+                return 0
+            fi
+            ;;
+        q|Q)
+            echo "Cancelled."
+            return 0
+            ;;
+        *)
+            echo -e "${RED}Invalid choice.${NC}"
+            return 1
+            ;;
+    esac
+
+    sudo systemctl daemon-reload
+    echo -e "${GREEN}✓ systemd reloaded${NC}"
+    echo ""
+    echo -e "Run '$(basename "$0") status' to verify, or 'sudo mount -a' to activate changes."
+}
+
+# Interactive fstab management menu
+fstab_manage() {
+    echo -e "${BOLD}╔════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}║        Fstab Entry Manager             ║${NC}"
+    echo -e "${BOLD}╚════════════════════════════════════════╝${NC}"
+    echo ""
+
+    while true; do
+        echo -e "${BOLD}Actions:${NC}"
+        echo "  1) List fstab entries for $NAS_IP"
+        echo "  2) Add new fstab entries (generate + install)"
+        echo "  3) Remove fstab entries"
+        echo "  4) Edit an fstab entry"
+        echo "  q) Quit"
+        echo ""
+        echo -n "  > "
+        read -r action
+
+        echo ""
+        case "$action" in
+            1) fstab_list ;;
+            2) generate_fstab ;;
+            3) fstab_remove ;;
+            4) fstab_edit ;;
+            q|Q) echo "Done."; return 0 ;;
+            *) echo -e "${RED}Invalid choice.${NC}" ;;
+        esac
+        echo ""
+    done
+}
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 usage() {
@@ -163,6 +530,9 @@ usage() {
     echo "  status,   s       Show current mount status"
     echo "  discover, d       Discover available shares (SMB or NFS)"
     echo "  fstab,    f       Generate /etc/fstab entries"
+    echo "  fstab-manage      Interactive fstab manager (list/add/remove/edit)"
+    echo "  fstab-remove      Remove fstab entries for NAS shares"
+    echo "  fstab-edit        Edit mount options on an fstab entry"
     echo "  setup,    w       Interactive setup wizard (discover + mount)"
     echo "  config,   c       Generate a config file interactively"
     echo "  help,     h       Show this help"
@@ -209,6 +579,9 @@ usage() {
     echo "  $(basename "$0") -e homes,photo mount              # Mount all except excluded shares"
     echo "  $(basename "$0") setup                             # Interactive guided setup"
     echo "  $(basename "$0") fstab                             # Generate fstab entries"
+    echo "  $(basename "$0") fstab-manage                      # Interactive fstab manager"
+    echo "  $(basename "$0") fstab-remove                      # Remove fstab entries"
+    echo "  $(basename "$0") fstab-edit                        # Edit an fstab entry"
 }
 
 check_deps() {
@@ -1733,6 +2106,9 @@ case "${COMMAND:-}" in
     status|s)         show_status ;;
     discover|d)       discover_shares ;;
     fstab|f)          generate_fstab ;;
+    fstab-manage|fm)  fstab_manage ;;
+    fstab-remove|fr)  fstab_remove ;;
+    fstab-edit|fe)    fstab_edit ;;
     setup|wizard|w)   interactive_setup ;;
     config|c)         generate_config ;;
     *)                usage ;;

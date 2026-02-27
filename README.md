@@ -77,6 +77,9 @@ sudo apt install nfs-common
 | `status`   | `s`   | Show mount status, disk usage, and fstab info   |
 | `discover` | `d`   | List available shares (SMB) or exports (NFS)    |
 | `fstab`    | `f`   | Generate and optionally install fstab entries    |
+| `fstab-manage` | `fm` | Interactive fstab manager (list/add/remove/edit) |
+| `fstab-remove` | `fr` | Remove fstab entries for NAS shares            |
+| `fstab-edit`   | `fe` | Edit mount options on an existing fstab entry  |
 | `config`   | `c`   | Interactive config file generator                |
 | `setup`    | `w`   | Interactive guided setup wizard                  |
 | `help`     | `h`   | Show help                                        |
@@ -226,6 +229,20 @@ The tool will:
 - Create mount directories **owned by your user** (not root)
 - **Auto-run** `systemctl daemon-reload` and `mount -a`
 - **Skip shares already in fstab** to prevent duplicates
+
+### Managing Fstab Entries
+
+Use the interactive fstab manager to list, add, remove, or edit entries:
+
+```bash
+./mount-nas.sh fstab-manage          # Interactive menu
+./mount-nas.sh fstab-remove          # Remove entries (select by number or 'all')
+./mount-nas.sh fstab-edit            # Edit mount point or options on an entry
+```
+
+The manager works with entries created by this tool **or added manually** — it finds
+all `/etc/fstab` lines matching your NAS IP. Removals and edits always **back up fstab
+first** (`/etc/fstab.bak.<timestamp>`), reload systemd, and optionally unmount removed shares.
 
 ### Fstab-Aware Mounting
 
