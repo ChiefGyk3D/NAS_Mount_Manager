@@ -18,7 +18,7 @@ NAS_PASS="${NAS_PASS:-}"
 SHARES="${NAS_SHARES:-}"
 PROTOCOL="${NAS_PROTOCOL:-smb}"       # smb or nfs
 SMB_VERSION="${NAS_SMB_VERSION:-3.0}"
-NFS_VERSION="${NAS_NFS_VERSION:-4.2}"
+NFS_VERSION="${NAS_NFS_VERSION:-4}"
 MOUNT_OPTS="${NAS_MOUNT_OPTS:-}"
 TIMEOUT=${NAS_TIMEOUT:-30}
 EXCLUDE_SHARES="${NAS_EXCLUDE_SHARES:-}"
@@ -403,13 +403,15 @@ build_nfs_opts() {
 }
 
 # Build the NFS-specific fstab options string (reused by generate_fstab and install_fstab)
+# Laptop-safe: _netdev (requires network), x-systemd.mount-timeout (caps hang time),
+# soft (returns errors instead of hanging forever when NAS disappears)
 build_nfs_fstab_opts() {
     local extra_opts="${MOUNT_OPTS:-nofail}"
-    local opts="vers=$NFS_VERSION,rsize=$RSIZE,wsize=$WSIZE,actimeo=$CACHE_TIME,hard,intr,timeo=$NFS_TIMEO,retrans=$NFS_RETRANS"
+    local opts="vers=$NFS_VERSION,rsize=$RSIZE,wsize=$WSIZE,actimeo=$CACHE_TIME,soft,timeo=$NFS_TIMEO,retrans=$NFS_RETRANS"
     if [ "$NFS_NCONNECT" -gt 0 ] 2>/dev/null; then
         opts="$opts,nconnect=$NFS_NCONNECT"
     fi
-    opts="$opts,$extra_opts,noauto,x-systemd.automount,x-systemd.idle-timeout=60"
+    opts="$opts,$extra_opts,_netdev,noauto,x-systemd.automount,x-systemd.idle-timeout=60,x-systemd.mount-timeout=10"
     echo "$opts"
 }
 
@@ -731,8 +733,46 @@ mount_all() {
         local mount_type
         mount_type=$(fstab_fstype)
         local mount_output
-        mount_output=$(sudo timeout "$TIMEOUT" mount -t "$mount_type" "$src" "$mp" -o "$cred_opts" 2>&1)
-        local exit_code=$?
+        local exit_code
+
+        # NFS version negotiation — if "Protocol not supported", try lower versions
+        if [[ "$PROTOCOL" == "nfs" ]]; then
+            local nfs_versions_to_try=("$NFS_VERSION")
+            # Build fallback list if user hasn't pinned a specific minor version
+            case "$NFS_VERSION" in
+                4|4.2) nfs_versions_to_try=(4.2 4.1 4.0 3) ;;
+                4.1)   nfs_versions_to_try=(4.1 4.0 3) ;;
+                4.0)   nfs_versions_to_try=(4.0 3) ;;
+            esac
+
+            local tried_version=""
+            for try_ver in "${nfs_versions_to_try[@]}"; do
+                local try_opts
+                try_opts=$(echo "$cred_opts" | sed "s/vers=[^,]*/vers=$try_ver/")
+                mount_output=$(sudo timeout "$TIMEOUT" mount -t "$mount_type" "$src" "$mp" -o "$try_opts" 2>&1)
+                exit_code=$?
+                tried_version="$try_ver"
+                # If it worked or error is NOT "Protocol not supported", stop trying
+                if [ $exit_code -eq 0 ] || ! echo "$mount_output" | grep -qi "protocol not supported"; then
+                    break
+                fi
+                # Unmount in case partial mount occurred
+                sudo umount "$mp" 2>/dev/null
+            done
+
+            # Update NFS_VERSION if a fallback worked (for subsequent mounts)
+            if [ $exit_code -eq 0 ] && [ "$tried_version" != "$NFS_VERSION" ]; then
+                echo -e "${GREEN}✓${NC} (NFSv$tried_version — v$NFS_VERSION not supported by server)"
+                NFS_VERSION="$tried_version"
+                # Rebuild cred_opts with the working version for remaining shares
+                cred_opts=$(build_cred_opts)
+                ((mounted++))
+                continue
+            fi
+        else
+            mount_output=$(sudo timeout "$TIMEOUT" mount -t "$mount_type" "$src" "$mp" -o "$cred_opts" 2>&1)
+            exit_code=$?
+        fi
 
         if [ $exit_code -eq 0 ]; then
             echo -e "${GREEN}✓${NC}"
@@ -836,19 +876,57 @@ show_status() {
 
     local mounted=0
     echo -e "  ${BOLD}Active mounts:${NC}"
-    for mp in "$MOUNT_BASE"/*/; do
-        [ ! -d "$mp" ] && continue
-        local name
-        name=$(basename "$mp")
-        if mountpoint -q "${mp%/}" 2>/dev/null; then
-            local size
-            size=$(df -h "${mp%/}" 2>/dev/null | tail -1 | awk '{print $3 "/" $2 " (" $5 " used)"}')
-            echo -e "    ${GREEN}● $name${NC}  $size"
-            ((mounted++))
-        else
-            echo -e "    ${RED}○ $name${NC}  (not mounted)"
-        fi
-    done
+
+    # Find all mount points under MOUNT_BASE from our NAS (handles nested paths like volume1/share)
+    # Use findmnt for reliable single-line output (mount wraps long NFS options across lines)
+    local found_any=false
+    while IFS= read -r mount_line; do
+        [ -z "$mount_line" ] && continue
+        local mount_src mount_mp
+        mount_src=$(echo "$mount_line" | awk '{print $1}')
+        mount_mp=$(echo "$mount_line" | awk '{print $2}')
+
+        found_any=true
+        local rel_path="${mount_mp#$MOUNT_BASE/}"
+        local size
+        size=$(df -h "$mount_mp" 2>/dev/null | tail -1 | awk '{print $3 "/" $2 " (" $5 " used)"}')
+        echo -e "    ${GREEN}● $rel_path${NC}  $size"
+        ((mounted++))
+    done <<< "$(findmnt -rn -o SOURCE,TARGET | grep "$NAS_IP")"
+
+    # Also check for unmounted directories under MOUNT_BASE (only top-level share dirs)
+    # Collect active mount points for comparison
+    local active_mounts
+    active_mounts=$(findmnt -rn -o TARGET | grep "^$MOUNT_BASE/")
+
+    if [ -d "$MOUNT_BASE" ]; then
+        while IFS= read -r mp; do
+            [ -z "$mp" ] && continue
+            # Skip directories that are inside an already-mounted path
+            local inside_mount=false
+            while IFS= read -r active_mp; do
+                [ -z "$active_mp" ] && continue
+                if [[ "$mp" == "$active_mp"/* ]] || [[ "$mp" == "$active_mp" ]]; then
+                    inside_mount=true
+                    break
+                fi
+            done <<< "$active_mounts"
+            $inside_mount && continue
+
+            if ! mountpoint -q "$mp" 2>/dev/null; then
+                local rel_path="${mp#$MOUNT_BASE/}"
+                # Only show if it looks like a share dir (not an intermediate dir with mounted children)
+                local has_mounted_child=false
+                for child in "$mp"/*/; do
+                    [ -d "$child" ] && mountpoint -q "${child%/}" 2>/dev/null && has_mounted_child=true && break
+                done
+                if ! $has_mounted_child; then
+                    found_any=true
+                    echo -e "    ${RED}○ $rel_path${NC}  (not mounted)"
+                fi
+            fi
+        done <<< "$(find "$MOUNT_BASE" -mindepth 1 -maxdepth 3 -type d 2>/dev/null)"
+    fi
 
     [ $mounted -eq 0 ] && echo "    No shares currently mounted"
     return 0
@@ -910,7 +988,7 @@ generate_fstab() {
             echo "$src  $mp  $fstype  $nfs_opts  0  0"
         else
             local smb_extra="${MOUNT_OPTS:-iocharset=utf8,file_mode=0775,dir_mode=0775,nofail}"
-            echo "$src  $mp  $fstype  credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,rsize=$RSIZE,wsize=$WSIZE,max_credits=$MAX_CREDITS,$smb_extra,noauto,x-systemd.automount,x-systemd.idle-timeout=60  0  0"
+            echo "$src  $mp  $fstype  credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,rsize=$RSIZE,wsize=$WSIZE,max_credits=$MAX_CREDITS,$smb_extra,_netdev,noauto,x-systemd.automount,x-systemd.idle-timeout=60,x-systemd.mount-timeout=10  0  0"
         fi
     done <<< "$share_list"
 
@@ -947,6 +1025,8 @@ generate_fstab() {
     echo ""
     echo -e "${YELLOW}Note: 'noauto,x-systemd.automount' means shares mount on-demand${NC}"
     echo -e "${YELLOW}      and disconnect after 60s idle — great for laptops.${NC}"
+    echo -e "${YELLOW}      '_netdev' ensures boot doesn't hang without network.${NC}"
+    echo -e "${YELLOW}      'x-systemd.mount-timeout=10' caps mount wait to 10s.${NC}"
     echo ""
 
     echo -n "Would you like to install these fstab entries now? (y/N): "
@@ -1090,7 +1170,7 @@ EOF
             entry="$src  $mp  $fstype  $nfs_opts  0  0"
         else
             local smb_extra="${MOUNT_OPTS:-iocharset=utf8,file_mode=0775,dir_mode=0775,nofail}"
-            entry="$src  $mp  $fstype  credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,rsize=$RSIZE,wsize=$WSIZE,max_credits=$MAX_CREDITS,$smb_extra,noauto,x-systemd.automount,x-systemd.idle-timeout=60  0  0"
+            entry="$src  $mp  $fstype  credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,rsize=$RSIZE,wsize=$WSIZE,max_credits=$MAX_CREDITS,$smb_extra,_netdev,noauto,x-systemd.automount,x-systemd.idle-timeout=60,x-systemd.mount-timeout=10  0  0"
         fi
 
         if is_in_fstab "$NAS_IP" "$share"; then
@@ -1149,6 +1229,38 @@ interactive_setup() {
         *)          PROTOCOL="smb" ;;
     esac
     echo -e "  → Protocol: ${CYAN}${PROTOCOL^^}${NC}"
+
+    # Auto-detect best NFS version if NFS selected
+    if [[ "$PROTOCOL" == "nfs" ]]; then
+        echo -n "  Detecting NFS version support... "
+        local detected_ver=""
+        for try_ver in 4.2 4.1 4.0 3; do
+            if timeout 5 rpcinfo -p "$NAS_IP" 2>/dev/null | grep -q "nfs"; then
+                # Use rpcinfo to check major version support
+                local major="${try_ver%%.*}"
+                if timeout 5 rpcinfo -p "$NAS_IP" 2>/dev/null | grep -q "nfs.*$major"; then
+                    # For minor version, try a quick test mount
+                    local probe_dir
+                    probe_dir=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/.nfs-probe-XXXXXX")
+                    if sudo timeout 5 mount -t nfs -o "vers=$try_ver,ro,noatime,timeo=30,retrans=1" "$NAS_IP":/ "$probe_dir" 2>/dev/null; then
+                        sudo umount "$probe_dir" 2>/dev/null
+                        rmdir "$probe_dir" 2>/dev/null
+                        detected_ver="$try_ver"
+                        break
+                    fi
+                    rmdir "$probe_dir" 2>/dev/null
+                fi
+            else
+                break
+            fi
+        done
+        if [ -n "$detected_ver" ]; then
+            NFS_VERSION="$detected_ver"
+            echo -e "${GREEN}NFSv$detected_ver${NC}"
+        else
+            echo -e "${YELLOW}could not detect (will use v$NFS_VERSION, with fallback)${NC}"
+        fi
+    fi
     echo ""
 
     # ── Step 3: Credentials (SMB only) ───────────────────────────────────
@@ -1362,6 +1474,22 @@ EOF
         chmod 600 "$CONFIG_FILE"
         echo -e "${GREEN}✓ Config saved to $CONFIG_FILE${NC}"
         echo -e "  Next time just run: ${CYAN}$(basename "$0") mount${NC}"
+    fi
+
+    # ── Optional: Set up fstab entries ───────────────────────────────────
+    echo ""
+    echo -e "${BOLD}Fstab Integration (optional)${NC}"
+    echo "  Adding fstab entries lets shares auto-mount when you access them,"
+    echo "  auto-disconnect when idle, and gracefully handle being off-network."
+    echo "  This is the recommended setup for laptops."
+    echo ""
+    echo -n "Set up fstab entries for these shares? (y/N): "
+    read -r setup_fstab
+    if [[ "$setup_fstab" =~ ^[Yy] ]]; then
+        echo ""
+        # Call the existing fstab generation with current settings
+        # The shares and protocol are already set from the wizard
+        generate_fstab
     fi
 }
 

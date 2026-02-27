@@ -97,7 +97,7 @@ sudo apt install nfs-common
 --wsize BYTES         Write buffer size in bytes (default: 4194304 / 4MB)
 --max-credits N       SMB3 max credits / request parallelism (default: 128)
 --smb-version VER     SMB protocol version for mount (default: 3.0)
---nfs-version VER     NFS protocol version for mount (default: 4.2)
+--nfs-version VER     NFS protocol version for mount (default: 4)
 --nfs-nconnect N      NFS multi-connection count, 0=disabled (default: 0)
 --nfs-timeo DS        NFS timeout in deciseconds (default: 150 = 15s)
 --nfs-retrans N       NFS retransmission count (default: 3)
@@ -160,7 +160,7 @@ TIMEOUT=30
 PROTOCOL="nfs"
 NAS_IP="192.168.1.10"
 MOUNT_BASE="/home/user/nas"
-NFS_VERSION="4.2"
+NFS_VERSION="4"
 SHARES="media,backups,documents"
 EXCLUDE_SHARES=""
 CACHE_TIME=10
@@ -176,14 +176,42 @@ The config file is automatically set to `chmod 600` and ignored by `.gitignore`.
 
 ## Fstab Integration
 
-### Generating Fstab Entries
+### Why Fstab? (Especially for Laptops)
+
+Fstab entries let systemd manage your NAS shares with **on-demand mounting** — which is
+ideal for laptops that roam between networks. The generated entries include:
+
+| Option | Purpose |
+|--------|---------|
+| `noauto` | Don't mount at boot — avoids boot hangs when not on your home network |
+| `x-systemd.automount` | Mount on first access (e.g. `cd ~/nas/media`) |
+| `x-systemd.idle-timeout=60` | Auto-unmount after 60s idle — saves resources on battery |
+| `x-systemd.mount-timeout=10` | Give up after 10s if NAS unreachable — prevents long freezes |
+| `_netdev` | Tells systemd this needs network — skips gracefully with no network |
+| `nofail` | Boot continues normally even if the mount fails |
+| `soft` (NFS only) | Returns errors instead of hanging forever if NAS disappears mid-transfer |
+
+**What happens on a laptop with these entries:**
+- **At home on your network**: `cd ~/nas/media` mounts instantly, unmounts when idle
+- **Away from home (coffee shop, travel)**: Accessing the path returns a quick error after 10s instead of freezing your terminal or file manager
+- **No network at all**: Boot is unaffected, no hangs, no delays
+- **NAS goes offline while mounted**: NFS `soft` returns an I/O error instead of hanging processes; SMB times out cleanly
+
+### Setting Up Fstab
+
+The easiest way is through the **setup wizard**, which offers fstab at the end:
+
+```bash
+./mount-nas.sh setup
+# ... walks through protocol, credentials, discovery, mounting ...
+# Then asks: "Set up fstab entries for these shares? (y/N)"
+```
+
+Or generate them directly:
 
 ```bash
 ./mount-nas.sh fstab
 ```
-
-This generates laptop-friendly entries with `noauto,x-systemd.automount,x-systemd.idle-timeout=60`.
-Shares auto-mount when you `cd` into them and auto-disconnect after 60 seconds of inactivity.
 
 Generated entries include `uid=` and `gid=` so mounted files are **owned by your user**, not root.
 The `actimeo` value (set via `--cache-time`) is baked into each entry for consistent caching.
@@ -228,7 +256,7 @@ Preview what would happen without actually mounting anything:
 | `NAS_MOUNT_BASE`     | Mount base path                      | `~/nas`             |
 | `NAS_SHARES`         | Comma-separated share list           | *(auto-discover)*   |
 | `NAS_SMB_VERSION`    | SMB protocol version                 | `3.0`               |
-| `NAS_NFS_VERSION`    | NFS protocol version                 | `4.2`               |
+| `NAS_NFS_VERSION`    | NFS protocol version                 | `4`                  |
 | `NAS_MOUNT_OPTS`     | Additional mount options             | *(protocol default)*|
 | `NAS_EXCLUDE_SHARES` | Comma-separated shares to skip       | *(none)*            |
 | `NAS_CACHE_TIME`     | Attribute cache timeout (seconds)    | `10`                |
@@ -506,10 +534,17 @@ MOUNT_OPTS="soft,nofail" ./mount-nas.sh --protocol nfs mount
 
 | Version | Notes |
 |---------|-------|
-| `3`     | Stateless, widely compatible, no `nconnect` support |
-| `4.0`   | Stateful, improved security, compound operations |
+| `4`     | **Default.** Auto-negotiates the highest supported NFSv4 minor version |
+| `4.2`   | Server-side copy, sparse files, best performance |
 | `4.1`   | Session trunking, `nconnect` support |
-| `4.2`   | **Default.** Server-side copy, sparse files, best performance |
+| `4.0`   | Stateful, improved security, compound operations |
+| `3`     | Stateless, widely compatible, no `nconnect` support |
+
+The default `4` tells the kernel to negotiate the highest NFSv4 minor version the
+server supports. If mounting fails with "Protocol not supported", the script
+automatically falls back through `4.2 → 4.1 → 4.0 → 3` until one works.
+
+The `setup` wizard also auto-detects the best version during its protocol step.
 
 ```bash
 # Use NFSv3 for old NAS devices
@@ -527,7 +562,7 @@ MOUNT_OPTS="soft,nofail" ./mount-nas.sh --protocol nfs mount
 | Multi-connection | — | Yes | 0 (off) | `--nfs-nconnect` |
 | Timeout | — | Yes | 150 (15s) | `--nfs-timeo` |
 | Retransmissions | — | Yes | 3 | `--nfs-retrans` |
-| Protocol version | Yes | Yes | 3.0 / 4.2 | `--smb-version` / `--nfs-version` |
+| Protocol version | Yes | Yes | 3.0 / 4 (auto) | `--smb-version` / `--nfs-version` |
 
 ### Downloading Large Files (ISOs, etc.)
 
