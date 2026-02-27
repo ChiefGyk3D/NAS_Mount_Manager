@@ -464,47 +464,108 @@ discover_shares() {
 }
 
 discover_nfs_shares() {
-    if ! command -v showmount &>/dev/null; then
-        echo -e "${YELLOW}showmount not installed. Install with: sudo apt install nfs-common${NC}"
-        return 1
+    echo "Discovering NFS exports on $NAS_IP..."
+
+    # ── Method 1: showmount (uses RPC portmapper, port 111) ─────────────
+    if command -v showmount &>/dev/null; then
+        local output
+        output=$(timeout "$TIMEOUT" showmount -e "$NAS_IP" 2>&1)
+        local rc=$?
+
+        if [ $rc -eq 0 ]; then
+            # Parse showmount output (skip header line)
+            # Format: /export/path  client-list
+            local share_list
+            share_list=$(echo "$output" | tail -n +2 | awk '{print $1}' | sed 's|^/||')
+
+            if [ -n "$share_list" ]; then
+                echo ""
+                echo -e "${BOLD}Available NFS exports (via showmount):${NC}"
+                while IFS= read -r line; do
+                    local export_path allowed_hosts
+                    export_path=$(echo "$line" | awk '{print $1}')
+                    allowed_hosts=$(echo "$line" | awk '{$1=""; print $0}' | xargs)
+                    local sname
+                    sname=$(echo "$export_path" | sed 's|^/||')
+                    if is_in_fstab "$NAS_IP" "$sname"; then
+                        echo -e "  ${CYAN}•${NC} $export_path  ${YELLOW}(fstab)${NC}  — allowed: $allowed_hosts"
+                    else
+                        echo -e "  ${CYAN}•${NC} $export_path  — allowed: $allowed_hosts"
+                    fi
+                done <<< "$(echo "$output" | tail -n +2)"
+                echo ""
+                DISCOVERED_SHARES="$share_list"
+                return 0
+            fi
+        else
+            echo -e "${YELLOW}showmount failed (RPC portmapper may be blocked).${NC}"
+            echo -e "${YELLOW}Trying NFSv4 pseudo-root fallback...${NC}"
+            echo ""
+        fi
+    else
+        echo -e "${YELLOW}showmount not found — trying NFSv4 pseudo-root fallback...${NC}"
+        echo ""
     fi
 
-    echo "Discovering NFS exports on $NAS_IP..."
-    local output
-    output=$(timeout "$TIMEOUT" showmount -e "$NAS_IP" 2>&1)
+    # ── Method 2: NFSv4 pseudo-root mount (no portmapper needed) ────────
+    # NFSv4 lets us mount the root export "/" and list top-level directories.
+    # This works even when RPC/portmapper (port 111) is firewalled, which
+    # is common on Synology, QNAP, TrueNAS, and many routers/firewalls.
+    discover_nfs_v4_root
+}
+
+# Browse the NFSv4 pseudo-root to enumerate exports
+discover_nfs_v4_root() {
+    local tmpdir
+    tmpdir=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/.nas-nfs-probe-XXXXXX")
+
+    echo "  Mounting NFSv4 pseudo-root ($NAS_IP:/) ..."
+    local mount_output
+    mount_output=$(sudo mount -t nfs -o vers=4,ro,noatime,timeo=50,retrans=1 \
+        "$NAS_IP":/ "$tmpdir" 2>&1)
     local rc=$?
 
     if [ $rc -ne 0 ]; then
-        echo -e "${RED}Failed to query NFS exports. Raw output:${NC}"
-        echo "$output" | head -20
+        rmdir "$tmpdir" 2>/dev/null
+        echo -e "${RED}Could not mount NFSv4 pseudo-root.${NC}"
+        echo -e "${RED}Raw output: $mount_output${NC}"
+        echo ""
+        echo -e "${YELLOW}Troubleshooting tips:${NC}"
+        echo "  • Ensure NFS is enabled on your NAS and this host's IP is in the allowed list"
+        echo "  • Check that port 2049 (NFS) is open:  nc -zv $NAS_IP 2049"
+        echo "  • For showmount, port 111 (portmapper) must also be open"
+        echo "  • On Synology: Control Panel → Shared Folder → NFS Permissions"
+        echo "  • On TrueNAS: Sharing → Unix Shares (NFS)"
+        echo ""
         return 1
     fi
 
-    # Parse showmount output (skip header line)
-    # Format: /export/path  client-list
+    # List top-level directories (the exported shares)
     local share_list
-    share_list=$(echo "$output" | tail -n +2 | awk '{print $1}' | sed 's|^/||')
+    share_list=$(ls -1 "$tmpdir" 2>/dev/null | grep -v '^\.' | sort)
+
+    sudo umount "$tmpdir" 2>/dev/null
+    rmdir "$tmpdir" 2>/dev/null
 
     if [ -n "$share_list" ]; then
         echo ""
-        echo -e "${BOLD}Available NFS exports:${NC}"
-        while IFS= read -r line; do
-            local export_path allowed_hosts
-            export_path=$(echo "$line" | awk '{print $1}')
-            allowed_hosts=$(echo "$line" | awk '{$1=""; print $0}' | xargs)
-            local sname
-            sname=$(echo "$export_path" | sed 's|^/||')
+        echo -e "${BOLD}Available NFS exports (via NFSv4 pseudo-root):${NC}"
+        while IFS= read -r sname; do
+            [ -z "$sname" ] && continue
             if is_in_fstab "$NAS_IP" "$sname"; then
-                echo -e "  ${CYAN}•${NC} $export_path  ${YELLOW}(fstab)${NC}  — allowed: $allowed_hosts"
+                echo -e "  ${CYAN}•${NC} /$sname  ${YELLOW}(fstab)${NC}"
             else
-                echo -e "  ${CYAN}•${NC} $export_path  — allowed: $allowed_hosts"
+                echo -e "  ${CYAN}•${NC} /$sname"
             fi
-        done <<< "$(echo "$output" | tail -n +2)"
+        done <<< "$share_list"
         echo ""
         DISCOVERED_SHARES="$share_list"
         return 0
     else
-        echo -e "${RED}No NFS exports found.${NC}"
+        echo -e "${RED}NFSv4 root mounted but no exports found.${NC}"
+        echo -e "${YELLOW}Your NAS may not export a browsable pseudo-root.${NC}"
+        echo "  You can enter share names manually if you know them."
+        echo ""
         return 1
     fi
 }
@@ -1131,7 +1192,14 @@ interactive_setup() {
         share_list="$DISCOVERED_SHARES"
     else
         echo ""
-        echo -n "  Enter share names manually (comma-separated): "
+        if [[ "$PROTOCOL" == "nfs" ]]; then
+            echo -e "  Enter NFS export names (without leading /)."
+            echo -e "  Example: ${CYAN}media,backups,documents${NC}"
+            echo -e "  (Check your NAS admin panel for the exact export paths)"
+        else
+            echo -e "  Example: ${CYAN}media,backups,documents${NC}"
+        fi
+        echo -n "  Share names (comma-separated): "
         read -r manual_shares
         share_list=$(echo "$manual_shares" | tr ',' '\n')
     fi

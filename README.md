@@ -294,10 +294,33 @@ sudo apt install libsecret-tools
 ### NFS-Specific Notes
 
 - NFS uses **host-based authentication** — the NAS controls access by client IP address or subnet, not username/password. The `-u`/`-p` flags are ignored for NFS.
-- NFS exports are discovered with `showmount -e` instead of `smbclient -L`.
-- NFS share names correspond to export paths on the server (e.g., `/volume1/media` becomes `volume1/media`).
 - File ownership in NFS relies on matching UIDs/GIDs between client and server. Ensure your user IDs match or use NFSv4 ID mapping.
+- NFS share names correspond to export paths on the server (e.g., `/volume1/media` becomes `volume1/media`).
 - The `--max-credits` option is SMB-specific and is ignored for NFS mounts.
+
+#### NFS Share Discovery
+
+The script discovers NFS exports using two methods (automatic fallback):
+
+1. **`showmount -e`** — queries the RPC portmapper (port 111). Fast and shows allowed hosts, but requires port 111 to be open. Many NAS firewalls block this.
+2. **NFSv4 pseudo-root** — mounts `NAS_IP:/` read-only and lists top-level directories. Works even when portmapper is blocked (only needs port 2049). Requires `sudo`.
+
+If both methods fail, you'll see troubleshooting tips and can enter share names manually.
+
+**Common NFS discovery issues:**
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `clnt_create: RPC: Unable to receive` | Port 111 blocked | Normal — the script auto-falls back to NFSv4 pseudo-root |
+| `mount: access denied` on pseudo-root | NAS doesn't allow your IP | Add this host's IP to the NFS allowed list on your NAS |
+| Pseudo-root mounts but shows 0 exports | NAS doesn't export a browsable root | Enter share names manually (check NAS admin panel) |
+| `showmount: command not found` | `nfs-common` not installed | `sudo apt install nfs-common` |
+
+**NAS-specific NFS setup:**
+- **Synology**: Control Panel → Shared Folder → Edit → NFS Permissions → Add your client IP
+- **TrueNAS**: Sharing → Unix Shares (NFS) → Add dataset paths
+- **QNAP**: Control Panel → Shared Folders → Edit → NFS host access
+- **OpenMediaVault**: Services → NFS → Shares
 
 ## Password Security
 
