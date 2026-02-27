@@ -1401,7 +1401,24 @@ interactive_setup() {
 
     echo ""
 
+    # ── Optional: Set up fstab entries ───────────────────────────────────
+    echo ""
+    echo -e "${BOLD}Fstab Integration (optional)${NC}"
+    echo "  Adding fstab entries lets shares auto-mount when you access them,"
+    echo "  auto-disconnect when idle, and gracefully handle being off-network."
+    echo "  This is the recommended setup for laptops."
+    echo ""
+    echo -n "Set up fstab entries for these shares? (y/N): "
+    read -r setup_fstab
+    if [[ "$setup_fstab" =~ ^[Yy] ]]; then
+        echo ""
+        # Call the existing fstab generation with current settings
+        # The shares and protocol are already set from the wizard
+        generate_fstab
+    fi
+
     # ── Optional: Save config ────────────────────────────────────────────
+    echo ""
     echo -n "Save these settings to config file for next time? (y/N): "
     read -r save_config
     if [[ "$save_config" =~ ^[Yy] ]]; then
@@ -1474,22 +1491,6 @@ EOF
         chmod 600 "$CONFIG_FILE"
         echo -e "${GREEN}✓ Config saved to $CONFIG_FILE${NC}"
         echo -e "  Next time just run: ${CYAN}$(basename "$0") mount${NC}"
-    fi
-
-    # ── Optional: Set up fstab entries ───────────────────────────────────
-    echo ""
-    echo -e "${BOLD}Fstab Integration (optional)${NC}"
-    echo "  Adding fstab entries lets shares auto-mount when you access them,"
-    echo "  auto-disconnect when idle, and gracefully handle being off-network."
-    echo "  This is the recommended setup for laptops."
-    echo ""
-    echo -n "Set up fstab entries for these shares? (y/N): "
-    read -r setup_fstab
-    if [[ "$setup_fstab" =~ ^[Yy] ]]; then
-        echo ""
-        # Call the existing fstab generation with current settings
-        # The shares and protocol are already set from the wizard
-        generate_fstab
     fi
 }
 
