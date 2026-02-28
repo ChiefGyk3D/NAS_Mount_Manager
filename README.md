@@ -60,6 +60,9 @@ sudo apt install nfs-common
 # Mount specific exports
 ./mount-nas.sh --protocol nfs -s media,backups mount
 
+# Repair stale/broken NFS mounts (resets systemd automount units)
+./mount-nas.sh --protocol nfs repair
+
 # Generate fstab entries for NFS
 ./mount-nas.sh --protocol nfs fstab
 
@@ -74,6 +77,7 @@ sudo apt install nfs-common
 | `mount`    | `m`   | Mount NAS shares (skips fstab-managed ones)     |
 | `remount`  | `r`   | Unmount and re-mount all NAS shares             |
 | `unmount`  | `u`   | Unmount all NAS shares (cleans empty dirs)      |
+| `repair`   | `x`   | Detect and fix stale/broken mounts (automount-aware) |
 | `status`   | `s`   | Show mount status, disk usage, and fstab info   |
 | `discover` | `d`   | List available shares (SMB) or exports (NFS)    |
 | `fstab`    | `f`   | Generate and optionally install fstab entries    |
@@ -254,6 +258,41 @@ When you run `./mount-nas.sh mount`, shares that are already managed by fstab ar
 `./mount-nas.sh status` shows both active mounts and existing fstab entries for your NAS,
 so you can see at a glance what's managed where.
 
+### Repairing Stale Mounts
+
+NFS mounts (especially on laptops) can go **stale** when the NAS becomes temporarily
+unreachable — e.g. after sleep/wake, network changes, or VPN toggling. A stale mount
+appears in `mount` output but hangs when you try to access it. The `repair` command
+fixes this automatically:
+
+```bash
+./mount-nas.sh repair                     # Repair all fstab-managed shares
+./mount-nas.sh --protocol nfs repair      # Explicitly specify NFS
+```
+
+**What `repair` does for each fstab-managed share:**
+
+1. **Pings the NAS** to confirm it's reachable
+2. **Health-checks each mount** — attempts `stat` with a 3-second timeout
+3. If stale or unresponsive:
+   - **Lazy-unmounts** the dead kernel mount (`umount -l`)
+   - **Stops and resets** the systemd automount/mount units (`reset-failed`)
+   - **Restarts** the automount unit so on-demand mounting works again
+   - **Verifies access** by listing the share contents
+4. Reports a summary: OK / repaired / failed
+
+**When to use `repair` vs `remount`:**
+
+| Situation | Use |
+|-----------|-----|
+| One or two shares went stale, others are fine | `repair` — only touches broken ones |
+| All shares need a clean restart | `remount` — tears down and re-mounts everything |
+| Shares hang after sleep/wake or VPN toggle | `repair` — designed for exactly this |
+| Changed mount options in fstab | `remount` — picks up new options |
+
+> **Tip:** Avoid running `sudo umount -l` manually on automounted shares — it breaks the
+> systemd automount pipe and leaves the unit in a `failed` state. Use `repair` instead.
+
 ## Dry Run
 
 Preview what would happen without actually mounting anything:
@@ -301,6 +340,7 @@ Then use from anywhere:
 nas mount                      # Mount all shares (SMB default)
 nas --protocol nfs mount       # Mount NFS exports
 nas remount                    # Unmount and re-mount (e.g. to fix permissions)
+nas repair                     # Fix stale/broken mounts without full remount
 nas status                     # Check what's connected
 nas unmount                    # Disconnect everything
 nas -i 10.0.0.5 d              # Discover SMB shares on a different NAS
