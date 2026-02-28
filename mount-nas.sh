@@ -527,6 +527,7 @@ usage() {
     echo "  mount,    m       Mount NAS shares"
     echo "  remount,  r       Unmount and re-mount all NAS shares"
     echo "  unmount,  u       Unmount all NAS shares"
+    echo "  repair,   x       Detect and fix stale/broken mounts (automount-aware)"
     echo "  status,   s       Show current mount status"
     echo "  discover, d       Discover available shares (SMB or NFS)"
     echo "  fstab,    f       Generate /etc/fstab entries"
@@ -1004,6 +1005,162 @@ SMBEOF
         echo "$output" | head -20
         return 1
     fi
+}
+
+# ── Repair ────────────────────────────────────────────────────────────────────
+
+repair_all() {
+    echo -e "${BOLD}NAS Mount Repair${NC}"
+    echo "═══════════════════════════════════════"
+    echo ""
+
+    # 1. Check NAS reachability
+    echo -n "  Checking NAS at $NAS_IP … "
+    if ping -c1 -W2 "$NAS_IP" &>/dev/null; then
+        echo -e "${GREEN}reachable${NC}"
+    else
+        echo -e "${RED}unreachable${NC}"
+        echo -e "  ${RED}Cannot repair — NAS is offline or unreachable.${NC}"
+        echo -e "  ${YELLOW}Check your network connection and NAS power state.${NC}"
+        return 1
+    fi
+
+    # 2. Collect fstab-managed NFS/SMB entries for this NAS
+    local fstab_entries
+    fstab_entries=$(get_fstab_entries "$NAS_IP")
+    if [ -z "$fstab_entries" ]; then
+        echo -e "  ${YELLOW}No fstab entries found for $NAS_IP — nothing to repair.${NC}"
+        echo -e "  ${CYAN}Run '$(basename "$0") fstab' to generate entries first.${NC}"
+        return 0
+    fi
+
+    local repaired=0
+    local already_ok=0
+    local failed=0
+    local total=0
+
+    echo ""
+    echo -e "  ${BOLD}Checking shares…${NC}"
+    echo ""
+
+    while IFS= read -r fstab_line; do
+        [ -z "$fstab_line" ] && continue
+        local src mp fstype opts
+        src=$(echo "$fstab_line" | awk '{print $1}')
+        mp=$(echo "$fstab_line" | awk '{print $2}')
+        fstype=$(echo "$fstab_line" | awk '{print $3}')
+        opts=$(echo "$fstab_line" | awk '{print $4}')
+        local share_name
+        if [[ "$src" == //* ]]; then
+            share_name=$(echo "$src" | sed "s|//$NAS_IP/||")
+        else
+            share_name=$(echo "$src" | sed "s|$NAS_IP:/||")
+        fi
+        ((total++))
+
+        echo -n "    $share_name ($mp) … "
+
+        # Determine if this is a systemd automount entry
+        local uses_automount=false
+        echo "$opts" | grep -q 'x-systemd.automount' && uses_automount=true
+
+        # Derive the systemd unit names from the mount path
+        local escaped_mp
+        escaped_mp=$(systemd-escape --path "$mp")
+        local automount_unit="${escaped_mp}.automount"
+        local mount_unit="${escaped_mp}.mount"
+
+        # Check if the mount is healthy: can we stat it within 3 seconds?
+        local healthy=false
+        if mountpoint -q "$mp" 2>/dev/null; then
+            # Mount exists in kernel — test if it's responsive
+            if timeout 3 stat "$mp" &>/dev/null; then
+                healthy=true
+            fi
+        fi
+
+        if $healthy; then
+            echo -e "${GREEN}OK${NC}"
+            ((already_ok++))
+            continue
+        fi
+
+        # --- Needs repair ---
+        echo -e "${YELLOW}stale or down${NC}"
+
+        # Step A: Lazy-unmount any stale kernel mount
+        if mountpoint -q "$mp" 2>/dev/null; then
+            echo -n "      Lazy-unmounting stale mount … "
+            if sudo umount -l "$mp" 2>/dev/null; then
+                echo -e "${GREEN}done${NC}"
+            else
+                echo -e "${RED}failed${NC}"
+            fi
+        fi
+
+        if $uses_automount; then
+            # Step B: Reset and restart the automount unit
+            echo -n "      Resetting systemd automount … "
+            sudo systemctl stop "$automount_unit" 2>/dev/null
+            sudo systemctl stop "$mount_unit" 2>/dev/null
+            sudo systemctl reset-failed "$automount_unit" 2>/dev/null
+            sudo systemctl reset-failed "$mount_unit" 2>/dev/null
+            echo -e "${GREEN}done${NC}"
+
+            echo -n "      Starting $automount_unit … "
+            if sudo systemctl start "$automount_unit" 2>/dev/null; then
+                echo -e "${GREEN}done${NC}"
+            else
+                echo -e "${RED}failed${NC}"
+                ((failed++))
+                continue
+            fi
+
+            # Step C: Trigger the automount by accessing the path
+            echo -n "      Verifying access … "
+            if timeout 10 ls "$mp" &>/dev/null; then
+                echo -e "${GREEN}✓ working${NC}"
+                ((repaired++))
+            else
+                echo -e "${RED}✗ still not responding${NC}"
+                ((failed++))
+            fi
+        else
+            # Non-automount: just remount directly
+            echo -n "      Remounting $mp … "
+            if sudo mount "$mp" 2>/dev/null; then
+                echo -e "${GREEN}✓ mounted${NC}"
+                ((repaired++))
+            else
+                echo -e "${RED}✗ mount failed${NC}"
+                ((failed++))
+            fi
+        fi
+    done <<< "$fstab_entries"
+
+    echo ""
+    echo "═══════════════════════════════════════"
+    echo -e "  Total shares:  $total"
+    echo -e "  ${GREEN}Already OK:    $already_ok${NC}"
+    echo -e "  ${CYAN}Repaired:      $repaired${NC}"
+    [ $failed -gt 0 ] && echo -e "  ${RED}Failed:        $failed${NC}"
+    echo ""
+
+    if [ $failed -gt 0 ]; then
+        echo -e "  ${YELLOW}Some shares could not be repaired. Possible causes:${NC}"
+        echo -e "    • NFS export permissions on the NAS (check allowed IPs/subnets)"
+        echo -e "    • Share does not exist on the NAS anymore"
+        echo -e "    • Firewall blocking NFS/SMB ports"
+        echo -e "    • Try: sudo journalctl -u <mount-unit> --no-pager -n 20"
+        return 1
+    fi
+
+    if [ $repaired -gt 0 ]; then
+        echo -e "  ${GREEN}All shares repaired successfully!${NC}"
+    else
+        echo -e "  ${GREEN}All shares were already healthy — nothing to do.${NC}"
+    fi
+    return 0
 }
 
 mount_all() {
@@ -2103,6 +2260,7 @@ case "${COMMAND:-}" in
     mount|m)          mount_all ;;
     remount|r)        remount_all ;;
     unmount|umount|u) unmount_all ;;
+    repair|x)         repair_all ;;
     status|s)         show_status ;;
     discover|d)       discover_shares ;;
     fstab|f)          generate_fstab ;;
