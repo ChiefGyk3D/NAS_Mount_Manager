@@ -45,7 +45,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 DISCOVERED_SHARES=""
 DRY_RUN=false
 NO_COLOR=${NO_COLOR:-false}
@@ -806,6 +806,109 @@ trap cleanup_credentials EXIT INT TERM
 TEMP_CRED_FILE=""
 NO_SYMLINK=false
 
+# ── Automount Unit Helper ────────────────────────────────────────────────────
+
+# Start automount units for all fstab entries under MOUNT_BASE.
+# `mount -a` alone does NOT activate x-systemd.automount units that have
+# never been started — they remain "inactive dead" and folders appear empty.
+# This function explicitly starts each .automount unit so the kernel's autofs
+# triggers are registered and shares mount on first access.
+start_automount_units() {
+    local base="${1:-$MOUNT_BASE}"
+    local started=0
+    local fstab_mps
+    fstab_mps=$(grep -v '^#' /etc/fstab 2>/dev/null \
+        | grep 'x-systemd.automount' \
+        | awk '{print $2}' \
+        | grep "^$base/" || true)
+    if [ -z "$fstab_mps" ]; then
+        return 0
+    fi
+    while IFS= read -r mp; do
+        [ -z "$mp" ] && continue
+        local unit
+        unit=$(systemd-escape -p "$mp").automount
+        if systemctl is-active "$unit" &>/dev/null; then
+            continue  # Already running
+        fi
+        if sudo systemctl start "$unit" 2>/dev/null; then
+            echo -e "  ${GREEN}✓ Started $unit${NC}"
+            ((started++))
+        else
+            echo -e "  ${YELLOW}⚠ Could not start $unit${NC}"
+        fi
+    done <<< "$fstab_mps"
+    [ $started -gt 0 ] && echo -e "${GREEN}✓ $started automount unit(s) activated${NC}"
+}
+
+# Fully stop and disable old automount/mount units so they don't linger.
+# Just `systemctl stop` leaves the unit loaded; if systemd re-reads fstab
+# it can get confused. This does stop + reset-failed for both .automount
+# and .mount units.
+stop_old_units() {
+    local mp="$1"
+    local automount_unit mount_unit
+    automount_unit=$(systemd-escape -p "$mp").automount
+    mount_unit=$(systemd-escape -p "$mp").mount
+    sudo systemctl stop "$automount_unit" 2>/dev/null || true
+    sudo systemctl stop "$mount_unit" 2>/dev/null || true
+    sudo umount -l "$mp" 2>/dev/null || true
+    sudo systemctl reset-failed "$automount_unit" 2>/dev/null || true
+    sudo systemctl reset-failed "$mount_unit" 2>/dev/null || true
+}
+
+# ── File Manager Bookmark Helper ─────────────────────────────────────────────
+
+# Update GTK file manager bookmarks when NAS mount paths change.
+# Replaces old NAS-related bookmarks with the current MOUNT_BASE paths,
+# and adds bookmarks for any shares that don't already have one.
+update_bookmarks() {
+    local bookmark_file="$HOME/.config/gtk-3.0/bookmarks"
+    [ -f "$bookmark_file" ] || return 0  # No bookmarks file — nothing to update
+
+    local base="$MOUNT_BASE"
+    local shares
+    shares=$(grep -v '^#' /etc/fstab 2>/dev/null \
+        | awk -v b="$base" '$2 ~ "^"b"/" {print $2}' || true)
+    [ -z "$shares" ] && return 0
+
+    # Build a map of share paths that should have bookmarks
+    local -a new_bookmarks=()
+    while IFS= read -r mp; do
+        [ -z "$mp" ] && continue
+        local share_name
+        share_name=$(basename "$mp")
+        # Generate a display name: replace underscores/hyphens with spaces, title case
+        local label
+        label=$(echo "$share_name" | sed 's/[_-]/ /g;s/\b\(.\)/\u\1/g')
+        new_bookmarks+=("file://$mp $label")
+    done <<< "$shares"
+
+    # Read existing bookmarks, filter out any old NAS-related lines
+    local -a kept_bookmarks=()
+    while IFS= read -r line; do
+        local path
+        path=$(echo "$line" | awk '{print $1}')
+        # Keep bookmarks that don't look like NAS mount paths
+        # Remove: old /mnt/*_nas, old ~/nas/*, current MOUNT_BASE/*
+        if echo "$path" | grep -qE "^file:///mnt/[^/]*_nas$|^file://$HOME/nas/|^file://$base/"; then
+            continue  # Strip old NAS bookmark
+        fi
+        kept_bookmarks+=("$line")
+    done < "$bookmark_file"
+
+    # Write back: NAS bookmarks first, then everything else
+    {
+        for bm in "${new_bookmarks[@]}"; do
+            echo "$bm"
+        done
+        for bm in "${kept_bookmarks[@]}"; do
+            echo "$bm"
+        done
+    } > "$bookmark_file"
+    echo -e "${GREEN}✓ Updated file manager bookmarks${NC}"
+}
+
 # ── Symlink Helper ───────────────────────────────────────────────────────────
 
 # Create a convenience symlink from ~/nas (or $SYMLINK_PATH) to $MOUNT_BASE.
@@ -921,19 +1024,14 @@ migrate_mounts() {
     sudo cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
     echo -e "${GREEN}✓ Backed up /etc/fstab${NC}"
 
-    # Stop automount units for old paths
+    # Stop automount units for old paths (full cleanup: stop + reset-failed)
     echo -e "${BOLD}Stopping old automount units...${NC}"
     while IFS= read -r line; do
         local content="${line#*:}"
         local mp
         mp=$(echo "$content" | awk '{print $2}')
-        local automount_unit
-        automount_unit=$(systemd-escape -p "$mp").automount
-        local mount_unit
-        mount_unit=$(systemd-escape -p "$mp").mount
-        sudo systemctl stop "$automount_unit" 2>/dev/null && \
-            echo -e "  ${GREEN}✓ Stopped $automount_unit${NC}" || true
-        sudo systemctl stop "$mount_unit" 2>/dev/null || true
+        stop_old_units "$mp"
+        echo -e "  ${GREEN}✓ Stopped units for $mp${NC}"
     done <<< "$old_entries"
 
     # Update fstab: replace old_base with new_base in mount point column
@@ -986,6 +1084,12 @@ migrate_mounts() {
     echo -e "${GREEN}✓ systemd reloaded${NC}"
     sudo mount -a 2>&1
     echo -e "${GREEN}✓ mount -a complete${NC}"
+
+    # Start automount units (mount -a alone doesn't activate them)
+    start_automount_units "$new_base"
+
+    # Update file manager bookmarks
+    update_bookmarks
 
     echo ""
     echo -e "${GREEN}Migration complete!${NC}"
@@ -1937,13 +2041,11 @@ EOF
             fi
             existing_mp=$(grep -E "^[^#].*$check_pattern" /etc/fstab 2>/dev/null | awk '{print $2}' | head -1)
             if [ -n "$existing_mp" ] && [ "$existing_mp" != "$mp" ]; then
-                # Old entry with different mount point — replace it
-                local old_automount old_mount
-                old_automount=$(systemd-escape -p "$existing_mp").automount
-                old_mount=$(systemd-escape -p "$existing_mp").mount
-                sudo systemctl stop "$old_automount" 2>/dev/null || true
-                sudo systemctl stop "$old_mount" 2>/dev/null || true
-                sudo umount -l "$existing_mp" 2>/dev/null || true
+                # Old entry with different mount point — stop old units, replace entry
+                stop_old_units "$existing_mp"
+                # Ensure new mount directory exists
+                sudo mkdir -p "$mp"
+                sudo chown "${mount_uid}:${mount_gid}" "$mp"
                 # Replace the line in fstab
                 local escaped_existing_mp
                 escaped_existing_mp=$(printf '%s\n' "$existing_mp" | sed 's/[[\.*^$()+?{|\\]/\\&/g')
@@ -1965,8 +2067,14 @@ EOF
     sudo mount -a 2>&1
     echo -e "${GREEN}✓ mount -a complete${NC}"
 
+    # Start automount units (mount -a alone doesn't activate them)
+    start_automount_units
+
     # Create convenience symlink (e.g. ~/nas → /mnt/nas)
     ensure_symlink
+
+    # Update file manager bookmarks
+    update_bookmarks
 
     echo ""
     echo -e "${GREEN}Done! Shares will auto-mount on access at $MOUNT_BASE/${NC}"
