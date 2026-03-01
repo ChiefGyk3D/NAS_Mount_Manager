@@ -45,7 +45,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 DISCOVERED_SHARES=""
 DRY_RUN=false
 NO_COLOR=${NO_COLOR:-false}
@@ -859,54 +859,191 @@ stop_old_units() {
 
 # ── File Manager Bookmark Helper ─────────────────────────────────────────────
 
-# Update GTK file manager bookmarks when NAS mount paths change.
-# Replaces old NAS-related bookmarks with the current MOUNT_BASE paths,
-# and adds bookmarks for any shares that don't already have one.
-update_bookmarks() {
-    local bookmark_file="$HOME/.config/gtk-3.0/bookmarks"
-    [ -f "$bookmark_file" ] || return 0  # No bookmarks file — nothing to update
-
+# Collect the list of NAS share mount points from fstab.
+# Returns one absolute path per line.
+_get_nas_share_paths() {
     local base="$MOUNT_BASE"
+    grep -v '^#' /etc/fstab 2>/dev/null \
+        | awk -v b="$base" '$2 ~ "^"b"/" {print $2}' || true
+}
+
+# Generate a human-readable label from a share directory name.
+# e.g. "3dprinting" → "3dprinting", "vm_iso" → "Vm Iso", "80hd" → "80hd"
+_share_label() {
+    echo "$1" | sed 's/[_-]/ /g;s/\b\(.\)/\u\1/g'
+}
+
+# Regex pattern matching old NAS bookmark URIs that should be replaced.
+_old_nas_uri_pattern() {
+    local base="$MOUNT_BASE"
+    # Matches: /mnt/*_nas (old layout), ~/nas/*, current MOUNT_BASE/*
+    echo "^file:///mnt/[^/]*_nas$|^file://$HOME/nas/|^file://$base/"
+}
+
+# ── GTK bookmarks (GTK3 + GTK4) ──────────────────────────────────────
+
+# Update a GTK-style bookmarks file (one "file:///path Label" per line).
+# Used by Nautilus, Thunar, Nemo, Cosmic Files, and most GTK file managers.
+_update_gtk_bookmarks() {
+    local bookmark_file="$1"
+    [ -f "$bookmark_file" ] || return 0
+
     local shares
-    shares=$(grep -v '^#' /etc/fstab 2>/dev/null \
-        | awk -v b="$base" '$2 ~ "^"b"/" {print $2}' || true)
+    shares=$(_get_nas_share_paths)
     [ -z "$shares" ] && return 0
 
-    # Build a map of share paths that should have bookmarks
+    local pattern
+    pattern=$(_old_nas_uri_pattern)
+
+    # Build new NAS bookmark lines
     local -a new_bookmarks=()
     while IFS= read -r mp; do
         [ -z "$mp" ] && continue
-        local share_name
-        share_name=$(basename "$mp")
-        # Generate a display name: replace underscores/hyphens with spaces, title case
         local label
-        label=$(echo "$share_name" | sed 's/[_-]/ /g;s/\b\(.\)/\u\1/g')
+        label=$(_share_label "$(basename "$mp")")
         new_bookmarks+=("file://$mp $label")
     done <<< "$shares"
 
-    # Read existing bookmarks, filter out any old NAS-related lines
+    # Keep non-NAS bookmarks
     local -a kept_bookmarks=()
     while IFS= read -r line; do
-        local path
-        path=$(echo "$line" | awk '{print $1}')
-        # Keep bookmarks that don't look like NAS mount paths
-        # Remove: old /mnt/*_nas, old ~/nas/*, current MOUNT_BASE/*
-        if echo "$path" | grep -qE "^file:///mnt/[^/]*_nas$|^file://$HOME/nas/|^file://$base/"; then
-            continue  # Strip old NAS bookmark
+        local uri
+        uri=$(echo "$line" | awk '{print $1}')
+        if echo "$uri" | grep -qE "$pattern"; then
+            continue
         fi
         kept_bookmarks+=("$line")
     done < "$bookmark_file"
 
-    # Write back: NAS bookmarks first, then everything else
+    # Write: NAS bookmarks first, then the rest
     {
-        for bm in "${new_bookmarks[@]}"; do
-            echo "$bm"
-        done
-        for bm in "${kept_bookmarks[@]}"; do
-            echo "$bm"
-        done
+        for bm in "${new_bookmarks[@]}"; do echo "$bm"; done
+        for bm in "${kept_bookmarks[@]}"; do echo "$bm"; done
     } > "$bookmark_file"
-    echo -e "${GREEN}✓ Updated file manager bookmarks${NC}"
+}
+
+# ── KDE / XBEL bookmarks ─────────────────────────────────────────────
+
+# Update the XBEL bookmark file used by KDE Dolphin, KDE file dialogs,
+# and some other Qt-based file managers.
+# Format: XML <bookmark href="file:///path"><title>Label</title>...</bookmark>
+_update_xbel_bookmarks() {
+    local xbel_file="$1"
+    [ -f "$xbel_file" ] || return 0
+
+    local shares
+    shares=$(_get_nas_share_paths)
+    [ -z "$shares" ] && return 0
+
+    local pattern
+    pattern=$(_old_nas_uri_pattern)
+    local changed=false
+
+    # Remove old NAS bookmarks from the XBEL file
+    # Match <bookmark href="file:///mnt/*_nas"> or href containing old paths
+    local old_mnt_pattern="/mnt/[^\"]*_nas\""
+    local old_home_pattern="$HOME/nas/"
+    local cur_base_pattern="$MOUNT_BASE/"
+    if grep -qE "href=\"file://(${old_mnt_pattern}|${old_home_pattern}|${cur_base_pattern})" "$xbel_file" 2>/dev/null; then
+        # Use sed to remove entire <bookmark>...</bookmark> blocks for old NAS paths
+        # This handles the multi-line XML structure
+        local tmpfile
+        tmpfile=$(mktemp)
+        awk -v old_mnt="$old_mnt_pattern" \
+            -v old_home="$old_home_pattern" \
+            -v cur_base="$cur_base_pattern" '
+        BEGIN { skip=0 }
+        /<bookmark / {
+            if ($0 ~ "href=\"file:///mnt/[^\"]*_nas\"" ||
+                $0 ~ "href=\"file://" old_home ||
+                $0 ~ "href=\"file://" cur_base) {
+                skip=1
+                next
+            }
+        }
+        /<\/bookmark>/ {
+            if (skip) { skip=0; next }
+        }
+        { if (!skip) print }
+        ' "$xbel_file" > "$tmpfile"
+        cp "$tmpfile" "$xbel_file"
+        rm -f "$tmpfile"
+        changed=true
+    fi
+
+    # Add new NAS bookmarks before the closing </xbel> tag
+    local -a entries=()
+    local id_base
+    id_base=$(date +%s)
+    local idx=0
+    while IFS= read -r mp; do
+        [ -z "$mp" ] && continue
+        # Skip if already present
+        if grep -q "href=\"file://$mp\"" "$xbel_file" 2>/dev/null; then
+            continue
+        fi
+        local label
+        label=$(_share_label "$(basename "$mp")")
+        entries+=(" <bookmark href=\"file://$mp\">
+  <title>$label</title>
+  <info>
+   <metadata owner=\"http://freedesktop.org\">
+    <bookmark:icon name=\"folder-network\"/>
+   </metadata>
+   <metadata owner=\"http://www.kde.org\">
+    <ID>${id_base}/${idx}</ID>
+    <isSystemItem>false</isSystemItem>
+   </metadata>
+  </info>
+ </bookmark>")
+        ((idx++))
+        changed=true
+    done <<< "$shares"
+
+    if [ ${#entries[@]} -gt 0 ]; then
+        # Insert before </xbel>
+        local tmpfile
+        tmpfile=$(mktemp)
+        sed '/<\/xbel>/d' "$xbel_file" > "$tmpfile"
+        for entry in "${entries[@]}"; do
+            echo "$entry" >> "$tmpfile"
+        done
+        echo "</xbel>" >> "$tmpfile"
+        cp "$tmpfile" "$xbel_file"
+        rm -f "$tmpfile"
+    fi
+
+    $changed && return 0 || return 1
+}
+
+# ── Main bookmark updater ────────────────────────────────────────────
+
+# Update file manager bookmarks across all supported desktop environments.
+# Detects which bookmark files exist and updates each one.
+update_bookmarks() {
+    local updated=0
+
+    # GTK3 (Nautilus, Thunar, Nemo, Cosmic Files, Caja, PCManFM)
+    if [ -f "$HOME/.config/gtk-3.0/bookmarks" ]; then
+        _update_gtk_bookmarks "$HOME/.config/gtk-3.0/bookmarks"
+        ((updated++))
+    fi
+
+    # GTK4 (newer Nautilus, GNOME 42+)
+    if [ -f "$HOME/.config/gtk-4.0/bookmarks" ]; then
+        _update_gtk_bookmarks "$HOME/.config/gtk-4.0/bookmarks"
+        ((updated++))
+    fi
+
+    # KDE / XBEL (Dolphin, KDE file dialogs, some Qt file managers)
+    if [ -f "$HOME/.local/share/user-places.xbel" ]; then
+        _update_xbel_bookmarks "$HOME/.local/share/user-places.xbel"
+        ((updated++))
+    fi
+
+    if [ $updated -gt 0 ]; then
+        echo -e "${GREEN}✓ Updated file manager bookmarks ($updated bookmark file(s))${NC}"
+    fi
 }
 
 # ── Symlink Helper ───────────────────────────────────────────────────────────

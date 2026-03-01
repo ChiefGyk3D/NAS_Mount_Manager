@@ -336,8 +336,23 @@ This will:
 3. Create new mount directories
 4. Create a `~/nas → /mnt/nas` symlink
 5. Reload systemd and activate the new mounts
+6. Update file manager bookmarks across all supported desktop environments
 
 All fstab entries are backed up before modification.
+
+### File Manager Bookmark Support
+
+When mounts are installed or migrated, NAS Mount Manager automatically adds
+sidebar bookmarks for every NAS share in your file manager. Supported formats:
+
+| Desktop / File Manager | Bookmark File | Format |
+|------------------------|---------------|--------|
+| GNOME (Nautilus), Xfce (Thunar), Cinnamon (Nemo), COSMIC Files, Caja, PCManFM | `~/.config/gtk-3.0/bookmarks` | Text |
+| GNOME 42+ (Nautilus on GTK4) | `~/.config/gtk-4.0/bookmarks` | Text |
+| KDE (Dolphin), Qt file dialogs | `~/.local/share/user-places.xbel` | XBEL/XML |
+
+All detected bookmark files are updated simultaneously. Old NAS bookmarks
+(from previous mount paths) are automatically replaced with the current paths.
 
 ## Environment Variables
 
