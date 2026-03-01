@@ -84,6 +84,7 @@ sudo apt install nfs-common
 | `fstab-manage` | `fm` | Interactive fstab manager (list/add/remove/edit) |
 | `fstab-remove` | `fr` | Remove fstab entries for NAS shares            |
 | `fstab-edit`   | `fe` | Edit mount options on an existing fstab entry  |
+| `migrate`    |       | Migrate mounts from ~/nas to /mnt/nas (Flatpak fix) |
 | `config`   | `c`   | Interactive config file generator                |
 | `setup`    | `w`   | Interactive guided setup wizard                  |
 | `help`     | `h`   | Show help                                        |
@@ -95,7 +96,9 @@ sudo apt install nfs-common
 --protocol TYPE       Protocol: smb or nfs (default: smb)
 -u, --user USER       SMB username
 -p, --pass PASS       SMB password
--m, --mount PATH      Mount base path (default: ~/nas)
+-m, --mount PATH      Mount base path (default: /mnt/nas)
+--symlink PATH        Convenience symlink path (default: ~/nas)
+--no-symlink          Don't create ~/nas symlink
 -s, --shares LIST     Comma-separated share names
 -e, --exclude LIST    Comma-separated shares to skip (e.g. homes,photo)
 -t, --timeout SEC     Connection timeout in seconds (default: 30)
@@ -149,7 +152,7 @@ PROTOCOL="smb"
 NAS_IP="192.168.1.10"
 NAS_USER="myuser"
 NAS_PASS="mypassword"
-MOUNT_BASE="/home/user/nas"
+MOUNT_BASE="/mnt/nas"
 SMB_VERSION="3.0"
 SHARES="media,backups,documents"
 EXCLUDE_SHARES="homes,photo"
@@ -166,7 +169,7 @@ TIMEOUT=30
 # nas.conf
 PROTOCOL="nfs"
 NAS_IP="192.168.1.10"
-MOUNT_BASE="/home/user/nas"
+MOUNT_BASE="/mnt/nas"
 NFS_VERSION="4"
 SHARES="media,backups,documents"
 EXCLUDE_SHARES=""
@@ -301,6 +304,41 @@ Preview what would happen without actually mounting anything:
 ./mount-nas.sh --dry-run -u myuser mount
 ```
 
+## Flatpak Compatibility
+
+When NAS shares are mounted under `/home` (the old default `~/nas`), **Flatpak apps
+fail to launch** with errors like:
+
+```
+bwrap: Can't bind mount /oldroot/home on /newroot/home: Unable to remount recursively with correct flags: No such device
+error: Failed to sync with dbus proxy
+```
+
+This happens because Flatpak's sandbox (bubblewrap) tries to recursively bind-mount
+`/home`, which fails on `autofs` mount points created by `x-systemd.automount`.
+
+**The fix:** Mount NAS shares outside `/home`. As of v2.1.0, the default `MOUNT_BASE`
+is `/mnt/nas` instead of `~/nas`. A convenience symlink `~/nas → /mnt/nas` is
+automatically created so your workflow stays the same.
+
+### Migrating Existing Installs
+
+If you set up NAS mounts with an older version (using `~/nas`), run the migration
+command to move them to `/mnt/nas`:
+
+```bash
+./mount-nas.sh migrate
+```
+
+This will:
+1. Stop existing automount units
+2. Update `/etc/fstab` entries to use `/mnt/nas`
+3. Create new mount directories
+4. Create a `~/nas → /mnt/nas` symlink
+5. Reload systemd and activate the new mounts
+
+All fstab entries are backed up before modification.
+
 ## Environment Variables
 
 | Variable             | Description                          | Default             |
@@ -309,7 +347,8 @@ Preview what would happen without actually mounting anything:
 | `NAS_PROTOCOL`       | Protocol: `smb` or `nfs`             | `smb`               |
 | `NAS_USER`           | SMB username                         | *(prompt)*          |
 | `NAS_PASS`           | SMB password                         | *(prompt)*          |
-| `NAS_MOUNT_BASE`     | Mount base path                      | `~/nas`             |
+| `NAS_MOUNT_BASE`     | Mount base path                      | `/mnt/nas`          |
+| `NAS_SYMLINK`        | Convenience symlink path             | `~/nas`             |
 | `NAS_SHARES`         | Comma-separated share list           | *(auto-discover)*   |
 | `NAS_SMB_VERSION`    | SMB protocol version                 | `3.0`               |
 | `NAS_NFS_VERSION`    | NFS protocol version                 | `4`                  |

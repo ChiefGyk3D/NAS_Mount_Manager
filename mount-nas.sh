@@ -12,7 +12,8 @@ CONFIG_FILE="${NAS_CONFIG:-$SCRIPT_DIR/nas.conf}"
 
 # Defaults (overridden by config file, then CLI flags)
 NAS_IP="${NAS_IP:-192.168.1.10}"
-MOUNT_BASE="${NAS_MOUNT_BASE:-$HOME/nas}"
+MOUNT_BASE="${NAS_MOUNT_BASE:-/mnt/nas}"
+SYMLINK_PATH="${NAS_SYMLINK:-$HOME/nas}"
 NAS_USER="${NAS_USER:-}"
 NAS_PASS="${NAS_PASS:-}"
 SHARES="${NAS_SHARES:-}"
@@ -44,7 +45,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 DISCOVERED_SHARES=""
 DRY_RUN=false
 NO_COLOR=${NO_COLOR:-false}
@@ -534,6 +535,7 @@ usage() {
     echo "  fstab-manage      Interactive fstab manager (list/add/remove/edit)"
     echo "  fstab-remove      Remove fstab entries for NAS shares"
     echo "  fstab-edit        Edit mount options on an fstab entry"
+    echo "  migrate           Migrate mounts from ~/nas to /mnt/nas (Flatpak fix)"
     echo "  setup,    w       Interactive setup wizard (discover + mount)"
     echo "  config,   c       Generate a config file interactively"
     echo "  help,     h       Show this help"
@@ -544,6 +546,8 @@ usage() {
     echo "  -u, --user USER     SMB username"
     echo "  -p, --pass PASS     SMB password"
     echo "  -m, --mount PATH    Mount base path (default: $MOUNT_BASE)"
+    echo "  --symlink PATH      Convenience symlink path (default: $SYMLINK_PATH)"
+    echo "  --no-symlink        Don't create ~/nas symlink"
     echo "  -s, --shares LIST   Comma-separated share names"
     echo "  -e, --exclude LIST  Comma-separated shares to skip (e.g. homes,photo)"
     echo "  -t, --timeout SEC   Connection timeout in seconds (default: $TIMEOUT)"
@@ -800,6 +804,197 @@ cleanup_credentials() {
 # Ensure cleanup on exit
 trap cleanup_credentials EXIT INT TERM
 TEMP_CRED_FILE=""
+NO_SYMLINK=false
+
+# ── Symlink Helper ───────────────────────────────────────────────────────────
+
+# Create a convenience symlink from ~/nas (or $SYMLINK_PATH) to $MOUNT_BASE.
+# This lets users type "~/nas/..." while the actual mount is outside /home,
+# which avoids breaking Flatpak/bubblewrap (can't bind-mount autofs under /home).
+ensure_symlink() {
+    if $NO_SYMLINK; then
+        return 0
+    fi
+    # Only create symlink when MOUNT_BASE is outside $HOME
+    case "$MOUNT_BASE" in
+        "$HOME"/*|"$HOME") return 0 ;;
+    esac
+    local target="$MOUNT_BASE"
+    local link="$SYMLINK_PATH"
+    if [ -L "$link" ]; then
+        local current
+        current=$(readlink -f "$link" 2>/dev/null)
+        if [ "$current" = "$(readlink -f "$target" 2>/dev/null)" ]; then
+            return 0  # Already correct
+        fi
+        echo -e "${YELLOW}Updating symlink $link → $target${NC}"
+        rm -f "$link"
+    elif [ -d "$link" ] && [ -z "$(ls -A "$link" 2>/dev/null)" ]; then
+        # Empty directory at the symlink path — remove it to place the symlink
+        rmdir "$link" 2>/dev/null
+    elif [ -d "$link" ]; then
+        # Non-empty directory — likely an old mount base with autofs mount points.
+        # Try to stop automount units, unmount, and replace with symlink.
+        echo -e "${YELLOW}$link is an existing directory (old mount base). Cleaning up...${NC}"
+        local cleaned=true
+        # Stop automount/mount units and unmount everything under this path
+        while IFS= read -r mp; do
+            [ -z "$mp" ] && continue
+            local unit_automount unit_mount
+            unit_automount=$(systemd-escape -p "$mp").automount
+            unit_mount=$(systemd-escape -p "$mp").mount
+            sudo systemctl stop "$unit_automount" 2>/dev/null || true
+            sudo systemctl stop "$unit_mount" 2>/dev/null || true
+            sudo umount -l "$mp" 2>/dev/null || true
+        done < <(findmnt -rn -o TARGET 2>/dev/null | grep "^$link/" || true)
+        # Remove all empty subdirectories
+        find "$link" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+        # Try to remove the directory itself
+        if rmdir "$link" 2>/dev/null; then
+            echo -e "${GREEN}✓ Cleaned up old directory $link${NC}"
+        else
+            echo -e "${YELLOW}⚠ Cannot replace $link with symlink — directory not empty after cleanup${NC}"
+            echo -e "  ${CYAN}Try: ./mount-nas.sh migrate${NC}"
+            return 0
+        fi
+    elif [ -e "$link" ]; then
+        echo -e "${YELLOW}⚠ Cannot create symlink: $link already exists and is not a symlink or directory${NC}"
+        return 0
+    fi
+    ln -s "$target" "$link" 2>/dev/null && \
+        echo -e "${GREEN}✓ Created symlink $link → $target${NC}" || \
+        echo -e "${YELLOW}⚠ Could not create symlink $link → $target${NC}"
+}
+
+# ── Migrate Command ──────────────────────────────────────────────────────────
+
+# Migrate existing NAS mounts from $HOME/nas (or any path) to /mnt/nas.
+# Stops automount units, updates fstab, creates new mount dirs, adds symlink.
+migrate_mounts() {
+    local old_base="${1:-$HOME/nas}"
+    local new_base="$MOUNT_BASE"
+
+    if [ "$old_base" = "$new_base" ]; then
+        echo -e "${YELLOW}Old and new mount base are the same ($old_base) — nothing to migrate.${NC}"
+        return 0
+    fi
+
+    echo -e "${BOLD}╔════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}║     NAS Mount Manager — Migration      ║${NC}"
+    echo -e "${BOLD}╚════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  From: ${RED}$old_base${NC}"
+    echo -e "  To:   ${GREEN}$new_base${NC}"
+    echo ""
+
+    # Find fstab entries pointing to the old base
+    local old_entries
+    old_entries=$(grep -n "^[^#]" /etc/fstab 2>/dev/null | grep "$old_base/" || true)
+    if [ -z "$old_entries" ]; then
+        echo -e "${YELLOW}No fstab entries found with mount points under $old_base${NC}"
+        echo "Nothing to migrate."
+        return 0
+    fi
+
+    echo -e "${BOLD}Fstab entries to migrate:${NC}"
+    echo "────────────────────────────────────────"
+    while IFS= read -r line; do
+        local lineno="${line%%:*}"
+        local content="${line#*:}"
+        local mp
+        mp=$(echo "$content" | awk '{print $2}')
+        local share="${mp#$old_base/}"
+        echo -e "  Line $lineno: ${CYAN}$share${NC}  ($mp → $new_base/$share)"
+    done <<< "$old_entries"
+    echo "────────────────────────────────────────"
+    echo ""
+
+    echo -n "Proceed with migration? (y/N): "
+    read -r confirm
+    if [[ ! "$confirm" =~ ^[Yy] ]]; then
+        echo "Aborted."
+        return 0
+    fi
+    echo ""
+
+    # Backup fstab
+    sudo cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
+    echo -e "${GREEN}✓ Backed up /etc/fstab${NC}"
+
+    # Stop automount units for old paths
+    echo -e "${BOLD}Stopping old automount units...${NC}"
+    while IFS= read -r line; do
+        local content="${line#*:}"
+        local mp
+        mp=$(echo "$content" | awk '{print $2}')
+        local automount_unit
+        automount_unit=$(systemd-escape -p "$mp").automount
+        local mount_unit
+        mount_unit=$(systemd-escape -p "$mp").mount
+        sudo systemctl stop "$automount_unit" 2>/dev/null && \
+            echo -e "  ${GREEN}✓ Stopped $automount_unit${NC}" || true
+        sudo systemctl stop "$mount_unit" 2>/dev/null || true
+    done <<< "$old_entries"
+
+    # Update fstab: replace old_base with new_base in mount point column
+    echo -e "${BOLD}Updating fstab entries...${NC}"
+    # Use sed to replace the old base path with the new one (only in uncommented lines)
+    sudo sed -i "s|$old_base/|$new_base/|g" /etc/fstab
+    echo -e "${GREEN}✓ Updated mount points in /etc/fstab${NC}"
+
+    # Create new mount directories
+    local mount_uid=${SUDO_UID:-$(id -u)}
+    local mount_gid=${SUDO_GID:-$(id -g)}
+    sudo mkdir -p "$new_base"
+    sudo chown "$mount_uid:$mount_gid" "$new_base"
+    while IFS= read -r line; do
+        local content="${line#*:}"
+        local mp
+        mp=$(echo "$content" | awk '{print $2}')
+        local share="${mp#$old_base/}"
+        sudo mkdir -p "$new_base/$share"
+        sudo chown "$mount_uid:$mount_gid" "$new_base/$share"
+        echo -e "  ${GREEN}✓ Created $new_base/$share${NC}"
+    done <<< "$old_entries"
+
+    # Unmount and clean up old mount dirs
+    echo -e "${BOLD}Cleaning up old mount points...${NC}"
+    while IFS= read -r line; do
+        local content="${line#*:}"
+        local mp
+        mp=$(echo "$content" | awk '{print $2}')
+        sudo umount -l "$mp" 2>/dev/null || true
+        rmdir "$mp" 2>/dev/null || true
+    done <<< "$old_entries"
+    # Remove old base dir if empty
+    if [ -d "$old_base" ] && [ -z "$(ls -A "$old_base" 2>/dev/null)" ]; then
+        rmdir "$old_base" 2>/dev/null || true
+    elif [ -d "$old_base" ]; then
+        # Recursively remove empty parent dirs
+        find "$old_base" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+        rmdir "$old_base" 2>/dev/null || true
+    fi
+
+    # Create convenience symlink
+    SYMLINK_PATH="$old_base"
+    ensure_symlink
+    echo ""
+
+    # Reload systemd and activate
+    echo -e "${BOLD}Activating new mounts...${NC}"
+    sudo systemctl daemon-reload
+    echo -e "${GREEN}✓ systemd reloaded${NC}"
+    sudo mount -a 2>&1
+    echo -e "${GREEN}✓ mount -a complete${NC}"
+
+    echo ""
+    echo -e "${GREEN}Migration complete!${NC}"
+    echo -e "  Mounts now at: ${CYAN}$new_base${NC}"
+    if [ -L "$old_base" ]; then
+        echo -e "  Symlink:       ${CYAN}$old_base → $new_base${NC}"
+    fi
+    echo -e "  Flatpak apps should now work without errors."
+}
 
 # ── Commands ─────────────────────────────────────────────────────────────────
 
@@ -1204,6 +1399,7 @@ mount_all() {
     local mounted=0
     local failed=0
     local denied=0
+    local NEEDS_MIGRATION=false
 
     # Check for fstab-managed shares
     local fstab_entries
@@ -1235,6 +1431,17 @@ mount_all() {
                 fstab_pattern="//$NAS_IP/$share[[:space:]]"
             fi
             fstab_mp=$(echo "$fstab_entries" | grep -E "$fstab_pattern" | awk '{print $2}' | head -1)
+
+            # If the fstab mount point uses a different base than MOUNT_BASE,
+            # the entry is stale (e.g. old ~/nas vs new /mnt/nas). Flag for migration.
+            if [ -n "$fstab_mp" ] && [[ "$fstab_mp" != "$MOUNT_BASE"/* ]]; then
+                echo -e "  ${YELLOW}⊘ $share — fstab entry uses old path: ${fstab_mp}${NC}"
+                echo -e "    ${CYAN}Run './mount-nas.sh migrate' to move mounts to $MOUNT_BASE${NC}"
+                ((skipped++))
+                NEEDS_MIGRATION=true
+                continue
+            fi
+
             echo -e "  ${YELLOW}⊘ $share — managed by fstab (mount point: ${fstab_mp:-$mp})${NC}"
             echo -e "    ${CYAN}Use 'sudo mount $fstab_mp' or just 'cd $fstab_mp' if using automount${NC}"
             ((skipped++))
@@ -1327,6 +1534,22 @@ mount_all() {
     [ $skipped -gt 0 ] && echo -e "${YELLOW}Skipped: $skipped (fstab-managed)${NC}"
     [ $excluded -gt 0 ] && echo -e "${YELLOW}Excluded: $excluded${NC}"
     echo "Access shares at: $MOUNT_BASE/"
+
+    if $NEEDS_MIGRATION; then
+        echo ""
+        echo -e "${BOLD}Some shares have fstab entries pointing to a different mount base.${NC}"
+        echo -n "Run migration now to update them to $MOUNT_BASE? (y/N): "
+        read -r do_migrate
+        if [[ "$do_migrate" =~ ^[Yy] ]]; then
+            migrate_mounts
+            return $?
+        else
+            echo -e "  ${CYAN}You can run './mount-nas.sh migrate' later.${NC}"
+        fi
+    fi
+
+    # Create convenience symlink (e.g. ~/nas → /mnt/nas)
+    ensure_symlink
 }
 
 remount_all() {
@@ -1704,7 +1927,31 @@ EOF
         fi
 
         if is_in_fstab "$NAS_IP" "$share"; then
-            echo -e "${YELLOW}⊘ $share already in fstab — skipped${NC}"
+            # Check if the existing entry points to a different mount base
+            local existing_mp
+            local check_pattern
+            if [[ "$PROTOCOL" == "nfs" ]]; then
+                check_pattern="$NAS_IP:/$share[[:space:]]"
+            else
+                check_pattern="//$NAS_IP/$share[[:space:]]"
+            fi
+            existing_mp=$(grep -E "^[^#].*$check_pattern" /etc/fstab 2>/dev/null | awk '{print $2}' | head -1)
+            if [ -n "$existing_mp" ] && [ "$existing_mp" != "$mp" ]; then
+                # Old entry with different mount point — replace it
+                local old_automount old_mount
+                old_automount=$(systemd-escape -p "$existing_mp").automount
+                old_mount=$(systemd-escape -p "$existing_mp").mount
+                sudo systemctl stop "$old_automount" 2>/dev/null || true
+                sudo systemctl stop "$old_mount" 2>/dev/null || true
+                sudo umount -l "$existing_mp" 2>/dev/null || true
+                # Replace the line in fstab
+                local escaped_existing_mp
+                escaped_existing_mp=$(printf '%s\n' "$existing_mp" | sed 's/[[\.*^$()+?{|\\]/\\&/g')
+                sudo sed -i "\\|$check_pattern|s|$escaped_existing_mp|$mp|" /etc/fstab
+                echo -e "${GREEN}✓ Updated $share in fstab ($existing_mp → $mp)${NC}"
+            else
+                echo -e "${YELLOW}⊘ $share already in fstab — skipped${NC}"
+            fi
         else
             echo "$entry" | sudo tee -a /etc/fstab >/dev/null
             echo -e "${GREEN}✓ Added $share to fstab${NC}"
@@ -1717,6 +1964,10 @@ EOF
     echo -e "${GREEN}✓ systemd reloaded${NC}"
     sudo mount -a 2>&1
     echo -e "${GREEN}✓ mount -a complete${NC}"
+
+    # Create convenience symlink (e.g. ~/nas → /mnt/nas)
+    ensure_symlink
+
     echo ""
     echo -e "${GREEN}Done! Shares will auto-mount on access at $MOUNT_BASE/${NC}"
 }
@@ -2223,6 +2474,8 @@ while [[ $# -gt 0 ]]; do
         -u|--user)      NAS_USER="$2";     shift 2 ;;
         -p|--pass)      NAS_PASS="$2";     shift 2 ;;
         -m|--mount)     MOUNT_BASE="$2";   shift 2 ;;
+        --symlink)      SYMLINK_PATH="$2";  shift 2 ;;
+        --no-symlink)   NO_SYMLINK=true;    shift ;;
         -s|--shares)    SHARES="$2";       shift 2 ;;
         -e|--exclude)   EXCLUDE_SHARES="$2"; shift 2 ;;
         --smb-version)  SMB_VERSION="$2";  shift 2 ;;
@@ -2268,6 +2521,7 @@ case "${COMMAND:-}" in
     fstab-remove|fr)  fstab_remove ;;
     fstab-edit|fe)    fstab_edit ;;
     setup|wizard|w)   interactive_setup ;;
+    migrate)          migrate_mounts "$HOME/nas" ;;
     config|c)         generate_config ;;
     *)                usage ;;
 esac
