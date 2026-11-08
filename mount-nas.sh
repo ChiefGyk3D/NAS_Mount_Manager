@@ -17,7 +17,7 @@ SYMLINK_PATH="${NAS_SYMLINK:-$HOME/nas}"
 NAS_USER="${NAS_USER:-}"
 NAS_PASS="${NAS_PASS:-}"
 SHARES="${NAS_SHARES:-}"
-PROTOCOL="${NAS_PROTOCOL:-smb}"       # smb or nfs
+PROTOCOL="${NAS_PROTOCOL:-smb}" # smb or nfs
 SMB_VERSION="${NAS_SMB_VERSION:-3.0}"
 NFS_VERSION="${NAS_NFS_VERSION:-4}"
 MOUNT_OPTS="${NAS_MOUNT_OPTS:-}"
@@ -89,7 +89,7 @@ fstab_fstype() {
 # Validate the PROTOCOL variable
 validate_protocol() {
     case "$PROTOCOL" in
-        smb|nfs) ;;
+        smb | nfs) ;;
         *)
             echo -e "${RED}Error: --protocol must be 'smb' or 'nfs' (got '$PROTOCOL')${NC}" >&2
             exit 1
@@ -114,11 +114,11 @@ is_in_fstab() {
     local ip="$1" share="$2"
     if [[ "$PROTOCOL" == "nfs" ]]; then
         # NFS format: IP:/share followed by whitespace
-        grep -qE "$ip:/$share[[:space:]]" /etc/fstab 2>/dev/null
+        grep -qE "$ip:/${share}[[:space:]]" /etc/fstab 2>/dev/null
     else
         # SMB format: //ip/share followed by whitespace
         # Anchor match to avoid substring matches (e.g. "home" must not match "homes")
-        grep -qE "//$ip/$share[[:space:]]" /etc/fstab 2>/dev/null
+        grep -qE "//$ip/${share}[[:space:]]" /etc/fstab 2>/dev/null
     fi
 }
 
@@ -144,7 +144,7 @@ show_fstab_status() {
             else
                 echo -e "    ${CYAN}◆ $share${NC} → $mp ${GREEN}(auto-mount)${NC}"
             fi
-        done <<< "$entries"
+        done <<<"$entries"
         return 0
     fi
     return 1
@@ -215,7 +215,7 @@ fstab_list() {
         [ -n "$vers_match" ] && key_opts="${key_opts:+$key_opts, }$vers_match"
         [ -n "$key_opts" ] && echo -e "         Options: $key_opts"
         echo ""
-    done <<< "$entries"
+    done <<<"$entries"
     echo -e "  Total: $idx entry/entries  (fstab lines shown above)"
     return 0
 }
@@ -255,14 +255,17 @@ fstab_remove() {
         line_numbers+=("$lineno")
         share_names+=("$share")
         echo -e "  ${CYAN}[$idx]${NC}  $share  →  $mp  ($fstype)"
-    done <<< "$entries"
+    done <<<"$entries"
 
     echo ""
     echo "Enter numbers to remove (comma-separated), 'all' to remove all, or 'q' to cancel:"
     echo -n "  > "
     read -r selection
 
-    [[ "$selection" =~ ^[Qq] ]] && { echo "Cancelled."; return 0; }
+    [[ "$selection" =~ ^[Qq] ]] && {
+        echo "Cancelled."
+        return 0
+    }
 
     local -a to_remove=()
     if [[ "$selection" == "all" ]]; then
@@ -271,12 +274,12 @@ fstab_remove() {
         echo -e "${YELLOW}Will remove ALL $idx fstab entries for $ip${NC}"
     else
         # Parse comma-separated indices
-        IFS=',' read -ra indices <<< "$selection"
+        IFS=',' read -ra indices <<<"$selection"
         for i in "${indices[@]}"; do
-            i=$(echo "$i" | xargs)  # trim whitespace
+            i=$(echo "$i" | xargs) # trim whitespace
             if [[ "$i" =~ ^[0-9]+$ ]] && [ "$i" -ge 1 ] && [ "$i" -le "$idx" ]; then
-                to_remove+=("${line_numbers[$((i-1))]}")
-                echo -e "  Will remove: ${BOLD}${share_names[$((i-1))]}${NC} (fstab line ${line_numbers[$((i-1))]})"
+                to_remove+=("${line_numbers[$((i - 1))]}")
+                echo -e "  Will remove: ${BOLD}${share_names[$((i - 1))]}${NC} (fstab line ${line_numbers[$((i - 1))]})"
             else
                 echo -e "  ${RED}Invalid selection: $i (skipping)${NC}"
             fi
@@ -323,8 +326,8 @@ fstab_remove() {
                     local share="${share_names[$j]}"
                     local mp="$MOUNT_BASE/$share"
                     if mountpoint -q "$mp" 2>/dev/null; then
-                        sudo umount "$mp" 2>/dev/null && \
-                            echo -e "  ${GREEN}✓ Unmounted $share${NC}" || \
+                        sudo umount "$mp" 2>/dev/null &&
+                            echo -e "  ${GREEN}✓ Unmounted $share${NC}" ||
                             echo -e "  ${YELLOW}⊘ Could not unmount $share (may be busy)${NC}"
                     fi
                     # Stop the automount unit if it exists
@@ -380,13 +383,16 @@ fstab_edit() {
         echo -e "  ${CYAN}[$idx]${NC}  $share  ($fstype)"
         echo -e "        Options: $opts"
         echo ""
-    done <<< "$entries"
+    done <<<"$entries"
 
     echo "Select entry to edit (1-$idx), or 'q' to cancel:"
     echo -n "  > "
     read -r selection
 
-    [[ "$selection" =~ ^[Qq] ]] && { echo "Cancelled."; return 0; }
+    [[ "$selection" =~ ^[Qq] ]] && {
+        echo "Cancelled."
+        return 0
+    }
 
     if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "$idx" ]; then
         echo -e "${RED}Invalid selection.${NC}"
@@ -470,7 +476,7 @@ fstab_edit() {
                 return 0
             fi
             ;;
-        q|Q)
+        q | Q)
             echo "Cancelled."
             return 0
             ;;
@@ -510,7 +516,10 @@ fstab_manage() {
             2) generate_fstab ;;
             3) fstab_remove ;;
             4) fstab_edit ;;
-            q|Q) echo "Done."; return 0 ;;
+            q | Q)
+                echo "Done."
+                return 0
+                ;;
             *) echo -e "${RED}Invalid choice.${NC}" ;;
         esac
         echo ""
@@ -552,8 +561,8 @@ usage() {
     echo "  -e, --exclude LIST  Comma-separated shares to skip (e.g. homes,photo)"
     echo "  -t, --timeout SEC   Connection timeout in seconds (default: $TIMEOUT)"
     echo "  --cache-time SEC    Attribute cache timeout in seconds (default: $CACHE_TIME)"
-    echo "  --rsize BYTES       Read buffer size (default: $RSIZE / $((RSIZE/1048576))MB)"
-    echo "  --wsize BYTES       Write buffer size (default: $WSIZE / $((WSIZE/1048576))MB)"
+    echo "  --rsize BYTES       Read buffer size (default: $RSIZE / $((RSIZE / 1048576))MB)"
+    echo "  --wsize BYTES       Write buffer size (default: $WSIZE / $((WSIZE / 1048576))MB)"
     echo "  --max-credits N     SMB3 max credits / request parallelism (default: $MAX_CREDITS)"
     echo "  --smb-version VER   SMB protocol version (default: $SMB_VERSION)"
     echo "  --nfs-version VER   NFS protocol version (default: $NFS_VERSION)"
@@ -733,7 +742,7 @@ create_temp_credentials() {
     local tmpfile
     tmpfile=$(mktemp "$tmpdir/.nas-creds-XXXXXX")
     chmod 600 "$tmpfile"
-    cat > "$tmpfile" <<CREDEOF
+    cat >"$tmpfile" <<CREDEOF
 username=${NAS_USER}
 password=${NAS_PASS}
 CREDEOF
@@ -817,10 +826,10 @@ start_automount_units() {
     local base="${1:-$MOUNT_BASE}"
     local started=0
     local fstab_mps
-    fstab_mps=$(grep -v '^#' /etc/fstab 2>/dev/null \
-        | grep 'x-systemd.automount' \
-        | awk '{print $2}' \
-        | grep "^$base/" || true)
+    fstab_mps=$(grep -v '^#' /etc/fstab 2>/dev/null |
+        grep 'x-systemd.automount' |
+        awk '{print $2}' |
+        grep "^$base/" || true)
     if [ -z "$fstab_mps" ]; then
         return 0
     fi
@@ -829,7 +838,7 @@ start_automount_units() {
         local unit
         unit=$(systemd-escape -p "$mp").automount
         if systemctl is-active "$unit" &>/dev/null; then
-            continue  # Already running
+            continue # Already running
         fi
         if sudo systemctl start "$unit" 2>/dev/null; then
             echo -e "  ${GREEN}✓ Started $unit${NC}"
@@ -837,7 +846,7 @@ start_automount_units() {
         else
             echo -e "  ${YELLOW}⚠ Could not start $unit${NC}"
         fi
-    done <<< "$fstab_mps"
+    done <<<"$fstab_mps"
     [ $started -gt 0 ] && echo -e "${GREEN}✓ $started automount unit(s) activated${NC}"
 }
 
@@ -863,8 +872,8 @@ stop_old_units() {
 # Returns one absolute path per line.
 _get_nas_share_paths() {
     local base="$MOUNT_BASE"
-    grep -v '^#' /etc/fstab 2>/dev/null \
-        | awk -v b="$base" '$2 ~ "^"b"/" {print $2}' || true
+    grep -v '^#' /etc/fstab 2>/dev/null |
+        awk -v b="$base" '$2 ~ "^"b"/" {print $2}' || true
 }
 
 # Generate a human-readable label from a share directory name.
@@ -902,7 +911,7 @@ _update_gtk_bookmarks() {
         local label
         label=$(_share_label "$(basename "$mp")")
         new_bookmarks+=("file://$mp $label")
-    done <<< "$shares"
+    done <<<"$shares"
 
     # Keep non-NAS bookmarks
     local -a kept_bookmarks=()
@@ -913,13 +922,13 @@ _update_gtk_bookmarks() {
             continue
         fi
         kept_bookmarks+=("$line")
-    done < "$bookmark_file"
+    done <"$bookmark_file"
 
     # Write: NAS bookmarks first, then the rest
     {
         for bm in "${new_bookmarks[@]}"; do echo "$bm"; done
         for bm in "${kept_bookmarks[@]}"; do echo "$bm"; done
-    } > "$bookmark_file"
+    } >"$bookmark_file"
 }
 
 # ── KDE / XBEL bookmarks ─────────────────────────────────────────────
@@ -965,7 +974,7 @@ _update_xbel_bookmarks() {
             if (skip) { skip=0; next }
         }
         { if (!skip) print }
-        ' "$xbel_file" > "$tmpfile"
+        ' "$xbel_file" >"$tmpfile"
         cp "$tmpfile" "$xbel_file"
         rm -f "$tmpfile"
         changed=true
@@ -998,17 +1007,17 @@ _update_xbel_bookmarks() {
  </bookmark>")
         ((idx++))
         changed=true
-    done <<< "$shares"
+    done <<<"$shares"
 
     if [ ${#entries[@]} -gt 0 ]; then
         # Insert before </xbel>
         local tmpfile
         tmpfile=$(mktemp)
-        sed '/<\/xbel>/d' "$xbel_file" > "$tmpfile"
+        sed '/<\/xbel>/d' "$xbel_file" >"$tmpfile"
         for entry in "${entries[@]}"; do
-            echo "$entry" >> "$tmpfile"
+            echo "$entry" >>"$tmpfile"
         done
-        echo "</xbel>" >> "$tmpfile"
+        echo "</xbel>" >>"$tmpfile"
         cp "$tmpfile" "$xbel_file"
         rm -f "$tmpfile"
     fi
@@ -1057,7 +1066,7 @@ ensure_symlink() {
     fi
     # Only create symlink when MOUNT_BASE is outside $HOME
     case "$MOUNT_BASE" in
-        "$HOME"/*|"$HOME") return 0 ;;
+        "$HOME"/* | "$HOME") return 0 ;;
     esac
     local target="$MOUNT_BASE"
     local link="$SYMLINK_PATH"
@@ -1065,7 +1074,7 @@ ensure_symlink() {
         local current
         current=$(readlink -f "$link" 2>/dev/null)
         if [ "$current" = "$(readlink -f "$target" 2>/dev/null)" ]; then
-            return 0  # Already correct
+            return 0 # Already correct
         fi
         echo -e "${YELLOW}Updating symlink $link → $target${NC}"
         rm -f "$link"
@@ -1101,8 +1110,8 @@ ensure_symlink() {
         echo -e "${YELLOW}⚠ Cannot create symlink: $link already exists and is not a symlink or directory${NC}"
         return 0
     fi
-    ln -s "$target" "$link" 2>/dev/null && \
-        echo -e "${GREEN}✓ Created symlink $link → $target${NC}" || \
+    ln -s "$target" "$link" 2>/dev/null &&
+        echo -e "${GREEN}✓ Created symlink $link → $target${NC}" ||
         echo -e "${YELLOW}⚠ Could not create symlink $link → $target${NC}"
 }
 
@@ -1145,7 +1154,7 @@ migrate_mounts() {
         mp=$(echo "$content" | awk '{print $2}')
         local share="${mp#$old_base/}"
         echo -e "  Line $lineno: ${CYAN}$share${NC}  ($mp → $new_base/$share)"
-    done <<< "$old_entries"
+    done <<<"$old_entries"
     echo "────────────────────────────────────────"
     echo ""
 
@@ -1169,7 +1178,7 @@ migrate_mounts() {
         mp=$(echo "$content" | awk '{print $2}')
         stop_old_units "$mp"
         echo -e "  ${GREEN}✓ Stopped units for $mp${NC}"
-    done <<< "$old_entries"
+    done <<<"$old_entries"
 
     # Update fstab: replace old_base with new_base in mount point column
     echo -e "${BOLD}Updating fstab entries...${NC}"
@@ -1190,7 +1199,7 @@ migrate_mounts() {
         sudo mkdir -p "$new_base/$share"
         sudo chown "$mount_uid:$mount_gid" "$new_base/$share"
         echo -e "  ${GREEN}✓ Created $new_base/$share${NC}"
-    done <<< "$old_entries"
+    done <<<"$old_entries"
 
     # Unmount and clean up old mount dirs
     echo -e "${BOLD}Cleaning up old mount points...${NC}"
@@ -1200,7 +1209,7 @@ migrate_mounts() {
         mp=$(echo "$content" | awk '{print $2}')
         sudo umount -l "$mp" 2>/dev/null || true
         rmdir "$mp" 2>/dev/null || true
-    done <<< "$old_entries"
+    done <<<"$old_entries"
     # Remove old base dir if empty
     if [ -d "$old_base" ] && [ -z "$(ls -A "$old_base" 2>/dev/null)" ]; then
         rmdir "$old_base" 2>/dev/null || true
@@ -1246,7 +1255,7 @@ is_excluded() {
         return 1
     fi
     local excluded
-    IFS=',' read -ra excluded <<< "$EXCLUDE_SHARES"
+    IFS=',' read -ra excluded <<<"$EXCLUDE_SHARES"
     for ex in "${excluded[@]}"; do
         ex=$(echo "$ex" | xargs)
         if [ "$ex" = "$share" ]; then
@@ -1304,7 +1313,7 @@ discover_nfs_shares() {
                     else
                         echo -e "  ${CYAN}•${NC} $export_path  — allowed: $allowed_hosts"
                     fi
-                done <<< "$(echo "$output" | tail -n +2)"
+                done <<<"$(echo "$output" | tail -n +2)"
                 echo ""
                 DISCOVERED_SHARES="$share_list"
                 return 0
@@ -1369,7 +1378,7 @@ discover_nfs_v4_root() {
             else
                 echo -e "  ${CYAN}•${NC} /$sname"
             fi
-        done <<< "$share_list"
+        done <<<"$share_list"
         echo ""
         DISCOVERED_SHARES="$share_list"
         return 0
@@ -1397,16 +1406,16 @@ discover_smb_shares() {
         local smb_auth
         smb_auth=$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/.nas-smb-auth-XXXXXX")
         chmod 600 "$smb_auth"
-        cat > "$smb_auth" <<SMBEOF
+        cat >"$smb_auth" <<SMBEOF
 username=${NAS_USER}
 password=${NAS_PASS}
 SMBEOF
-        output=$(timeout "$TIMEOUT" smbclient -L "//$NAS_IP" -A "$smb_auth" --option="client min protocol=SMB2" 2>&1 \
-            | grep -v "smbXcli_negprot" | grep -v "Reconnecting with SMB1" | grep -v "Protocol negotiation" | grep -v "Unable to connect with SMB1")
+        output=$(timeout "$TIMEOUT" smbclient -L "//$NAS_IP" -A "$smb_auth" --option="client min protocol=SMB2" 2>&1 |
+            grep -v "smbXcli_negprot" | grep -v "Reconnecting with SMB1" | grep -v "Protocol negotiation" | grep -v "Unable to connect with SMB1")
         shred -u "$smb_auth" 2>/dev/null || rm -f "$smb_auth"
     else
-        output=$(timeout "$TIMEOUT" smbclient -L "//$NAS_IP" -N --option="client min protocol=SMB2" 2>&1 \
-            | grep -v "smbXcli_negprot" | grep -v "Reconnecting with SMB1" | grep -v "Protocol negotiation" | grep -v "Unable to connect with SMB1")
+        output=$(timeout "$TIMEOUT" smbclient -L "//$NAS_IP" -N --option="client min protocol=SMB2" 2>&1 |
+            grep -v "smbXcli_negprot" | grep -v "Reconnecting with SMB1" | grep -v "Protocol negotiation" | grep -v "Unable to connect with SMB1")
     fi
 
     local share_list
@@ -1432,7 +1441,7 @@ SMBEOF
                     echo -e "  ${CYAN}•${NC} $sname"
                 fi
             fi
-        done <<< "$(echo "$output" | grep -i 'Disk' | grep -Fv '$' | grep -v 'IPC')"
+        done <<<"$(echo "$output" | grep -i 'Disk' | grep -Fv '$' | grep -v 'IPC')"
         echo ""
         DISCOVERED_SHARES="$share_list"
         return 0
@@ -1572,7 +1581,7 @@ repair_all() {
                 ((failed++))
             fi
         fi
-    done <<< "$fstab_entries"
+    done <<<"$fstab_entries"
 
     echo ""
     echo "═══════════════════════════════════════"
@@ -1667,9 +1676,9 @@ mount_all() {
             local fstab_mp
             local fstab_pattern
             if [[ "$PROTOCOL" == "nfs" ]]; then
-                fstab_pattern="$NAS_IP:/$share[[:space:]]"
+                fstab_pattern="$NAS_IP:/${share}[[:space:]]"
             else
-                fstab_pattern="//$NAS_IP/$share[[:space:]]"
+                fstab_pattern="//$NAS_IP/${share}[[:space:]]"
             fi
             fstab_mp=$(echo "$fstab_entries" | grep -E "$fstab_pattern" | awk '{print $2}' | head -1)
 
@@ -1718,9 +1727,9 @@ mount_all() {
             local nfs_versions_to_try=("$NFS_VERSION")
             # Build fallback list if user hasn't pinned a specific minor version
             case "$NFS_VERSION" in
-                4|4.2) nfs_versions_to_try=(4.2 4.1 4.0 3) ;;
-                4.1)   nfs_versions_to_try=(4.1 4.0 3) ;;
-                4.0)   nfs_versions_to_try=(4.0 3) ;;
+                4 | 4.2) nfs_versions_to_try=(4.2 4.1 4.0 3) ;;
+                4.1) nfs_versions_to_try=(4.1 4.0 3) ;;
+                4.0) nfs_versions_to_try=(4.0 3) ;;
             esac
 
             local tried_version=""
@@ -1767,7 +1776,7 @@ mount_all() {
             echo -e "${RED}✗ $reason${NC}"
             ((failed++))
         fi
-    done <<< "$share_list"
+    done <<<"$share_list"
 
     echo ""
     echo -e "${GREEN}Mounted: $mounted${NC}  ${RED}Failed: $failed${NC}"
@@ -1886,7 +1895,7 @@ show_status() {
         size=$(df -h "$mount_mp" 2>/dev/null | tail -1 | awk '{print $3 "/" $2 " (" $5 " used)"}')
         echo -e "    ${GREEN}● $rel_path${NC}  $size"
         ((mounted++))
-    done <<< "$(findmnt -rn -o SOURCE,TARGET | grep "$NAS_IP")"
+    done <<<"$(findmnt -rn -o SOURCE,TARGET | grep "$NAS_IP")"
 
     # Also check for unmounted directories under MOUNT_BASE (only top-level share dirs)
     # Collect active mount points for comparison
@@ -1904,7 +1913,7 @@ show_status() {
                     inside_mount=true
                     break
                 fi
-            done <<< "$active_mounts"
+            done <<<"$active_mounts"
             $inside_mount && continue
 
             if ! mountpoint -q "$mp" 2>/dev/null; then
@@ -1919,7 +1928,7 @@ show_status() {
                     echo -e "    ${RED}○ $rel_path${NC}  (not mounted)"
                 fi
             fi
-        done <<< "$(find "$MOUNT_BASE" -mindepth 1 -maxdepth 3 -type d 2>/dev/null)"
+        done <<<"$(find "$MOUNT_BASE" -mindepth 1 -maxdepth 3 -type d 2>/dev/null)"
     fi
 
     [ $mounted -eq 0 ] && echo "    No shares currently mounted"
@@ -1984,7 +1993,7 @@ generate_fstab() {
             local smb_extra="${MOUNT_OPTS:-iocharset=utf8,file_mode=0775,dir_mode=0775,nofail}"
             echo "$src  $mp  $fstype  credentials=$cred_file,uid=$fstab_uid,gid=$fstab_gid,vers=$SMB_VERSION,actimeo=$CACHE_TIME,rsize=$RSIZE,wsize=$WSIZE,max_credits=$MAX_CREDITS,$smb_extra,_netdev,noauto,x-systemd.automount,x-systemd.idle-timeout=60,x-systemd.mount-timeout=10  0  0"
         fi
-    done <<< "$share_list"
+    done <<<"$share_list"
 
     [ $excluded_count -gt 0 ] && echo -e "\n${YELLOW}($excluded_count excluded share(s) omitted)${NC}"
 
@@ -2010,7 +2019,7 @@ generate_fstab() {
         [ -z "$share" ] && continue
         is_excluded "$share" && continue
         echo -e "     ${CYAN}sudo mkdir -p $MOUNT_BASE/$share${NC}"
-    done <<< "$share_list"
+    done <<<"$share_list"
     echo ""
     echo "  3. Add the lines above to /etc/fstab"
     echo ""
@@ -2033,7 +2042,7 @@ generate_fstab() {
             [ -z "$share" ] && continue
             is_excluded "$share" && continue
             filtered_list="${filtered_list}${share}"$'\n'
-        done <<< "$share_list"
+        done <<<"$share_list"
         filtered_list=$(echo "$filtered_list" | sed '/^$/d')
         install_fstab "$filtered_list" "$cred_file"
     fi
@@ -2090,7 +2099,7 @@ install_fstab() {
             ((test_failed++))
         fi
         rmdir "$test_mp" 2>/dev/null
-    done <<< "$share_list"
+    done <<<"$share_list"
 
     cleanup_credentials
 
@@ -2118,7 +2127,7 @@ install_fstab() {
     # ── Create credential file (SMB only) ────────────────────────────────
     if [[ "$PROTOCOL" == "smb" ]]; then
         echo -e "Creating credentials file at ${CYAN}$cred_file${NC}..."
-        sudo tee "$cred_file" > /dev/null <<EOF
+        sudo tee "$cred_file" >/dev/null <<EOF
 username=${NAS_USER:-guest}
 password=${NAS_PASS:-}
 EOF
@@ -2136,7 +2145,7 @@ EOF
         [ -z "$share" ] && continue
         sudo mkdir -p "$MOUNT_BASE/$share"
         sudo chown "$mount_uid:$mount_gid" "$MOUNT_BASE/$share"
-    done <<< "$verified_shares"
+    done <<<"$verified_shares"
     echo -e "${GREEN}✓ Mount points created${NC}"
 
     # Backup fstab
@@ -2172,9 +2181,9 @@ EOF
             local existing_mp
             local check_pattern
             if [[ "$PROTOCOL" == "nfs" ]]; then
-                check_pattern="$NAS_IP:/$share[[:space:]]"
+                check_pattern="$NAS_IP:/${share}[[:space:]]"
             else
-                check_pattern="//$NAS_IP/$share[[:space:]]"
+                check_pattern="//$NAS_IP/${share}[[:space:]]"
             fi
             existing_mp=$(grep -E "^[^#].*$check_pattern" /etc/fstab 2>/dev/null | awk '{print $2}' | head -1)
             if [ -n "$existing_mp" ] && [ "$existing_mp" != "$mp" ]; then
@@ -2195,7 +2204,7 @@ EOF
             echo "$entry" | sudo tee -a /etc/fstab >/dev/null
             echo -e "${GREEN}✓ Added $share to fstab${NC}"
         fi
-    done <<< "$verified_shares"
+    done <<<"$verified_shares"
 
     echo ""
     echo -e "${BOLD}Activating mounts...${NC}"
@@ -2251,8 +2260,8 @@ interactive_setup() {
     echo -n "  Choose [1]: "
     read -r proto_choice
     case "${proto_choice:-1}" in
-        2|nfs|NFS)  PROTOCOL="nfs" ;;
-        *)          PROTOCOL="smb" ;;
+        2 | nfs | NFS) PROTOCOL="nfs" ;;
+        *) PROTOCOL="smb" ;;
     esac
     echo -e "  → Protocol: ${CYAN}${PROTOCOL^^}${NC}"
 
@@ -2360,7 +2369,7 @@ interactive_setup() {
         share_array+=("$s")
         echo -e "  ${CYAN}$i)${NC} $s"
         ((i++))
-    done <<< "$share_list"
+    done <<<"$share_list"
     echo -e "  ${CYAN}A)${NC} All of the above"
     echo ""
 
@@ -2372,7 +2381,7 @@ interactive_setup() {
         selected_shares="$share_list"
         echo -e "  → Mounting ${GREEN}all${NC} shares"
     else
-        IFS=',' read -ra picks <<< "$selection"
+        IFS=',' read -ra picks <<<"$selection"
         for pick in "${picks[@]}"; do
             pick=$(echo "$pick" | xargs)
             if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le ${#share_array[@]} ]; then
@@ -2466,7 +2475,7 @@ interactive_setup() {
         fi
 
         if [[ "$PROTOCOL" == "nfs" ]]; then
-            cat > "$CONFIG_FILE" <<EOF
+            cat >"$CONFIG_FILE" <<EOF
 # NAS Mount Configuration — saved by setup wizard
 # Generated on $(date)
 PROTOCOL="$PROTOCOL"
@@ -2482,7 +2491,7 @@ NFS_TIMEO="$NFS_TIMEO"
 NFS_RETRANS="$NFS_RETRANS"
 EOF
         elif $save_pass_to_config; then
-            cat > "$CONFIG_FILE" <<EOF
+            cat >"$CONFIG_FILE" <<EOF
 # NAS Mount Configuration — saved by setup wizard
 # Generated on $(date)
 PROTOCOL="$PROTOCOL"
@@ -2498,7 +2507,7 @@ WSIZE="$WSIZE"
 MAX_CREDITS="$MAX_CREDITS"
 EOF
         else
-            cat > "$CONFIG_FILE" <<EOF
+            cat >"$CONFIG_FILE" <<EOF
 # NAS Mount Configuration — saved by setup wizard
 # Generated on $(date)
 # Password stored in system keyring
@@ -2532,8 +2541,11 @@ generate_config() {
     read -r input_proto
     local cfg_proto="${input_proto:-$PROTOCOL}"
     case "$cfg_proto" in
-        smb|nfs) ;;
-        *) echo -e "${RED}Invalid protocol '$cfg_proto'. Must be 'smb' or 'nfs'.${NC}"; return 1 ;;
+        smb | nfs) ;;
+        *)
+            echo -e "${RED}Invalid protocol '$cfg_proto'. Must be 'smb' or 'nfs'.${NC}"
+            return 1
+            ;;
     esac
 
     local cfg_user="" cfg_pass=""
@@ -2624,7 +2636,7 @@ generate_config() {
     fi
 
     if [[ "$cfg_proto" == "nfs" ]]; then
-        cat > "$CONFIG_FILE" <<EOF
+        cat >"$CONFIG_FILE" <<EOF
 # NAS Mount Configuration
 # Generated on $(date)
 
@@ -2645,7 +2657,7 @@ NFS_RETRANS="$cfg_retrans"
 # MOUNT_OPTS="nofail"
 EOF
     elif $save_pass_to_config; then
-        cat > "$CONFIG_FILE" <<EOF
+        cat >"$CONFIG_FILE" <<EOF
 # NAS Mount Configuration
 # Generated on $(date)
 
@@ -2666,7 +2678,7 @@ MAX_CREDITS="$cfg_credits"
 # MOUNT_OPTS="iocharset=utf8,file_mode=0775,dir_mode=0775,nofail"
 EOF
     else
-        cat > "$CONFIG_FILE" <<EOF
+        cat >"$CONFIG_FILE" <<EOF
 # NAS Mount Configuration
 # Generated on $(date)
 # Password is stored in the system keyring (secret-tool)
@@ -2714,32 +2726,112 @@ COMMAND=""
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -i|--ip)        NAS_IP="$2";       shift 2 ;;
-        --protocol)     PROTOCOL="$2";     shift 2 ;;
-        -u|--user)      NAS_USER="$2";     shift 2 ;;
-        -p|--pass)      NAS_PASS="$2";     shift 2 ;;
-        -m|--mount)     MOUNT_BASE="$2";   shift 2 ;;
-        --symlink)      SYMLINK_PATH="$2";  shift 2 ;;
-        --no-symlink)   NO_SYMLINK=true;    shift ;;
-        -s|--shares)    SHARES="$2";       shift 2 ;;
-        -e|--exclude)   EXCLUDE_SHARES="$2"; shift 2 ;;
-        --smb-version)  SMB_VERSION="$2";  shift 2 ;;
-        --nfs-version)  NFS_VERSION="$2";  shift 2 ;;
-        --nfs-nconnect) NFS_NCONNECT="$2";  shift 2 ;;
-        --nfs-timeo)    NFS_TIMEO="$2";    shift 2 ;;
-        --nfs-retrans)  NFS_RETRANS="$2";  shift 2 ;;
-        --timeout|-t)   TIMEOUT="$2";      shift 2 ;;
-        --cache-time)   CACHE_TIME="$2";     shift 2 ;;
-        --rsize)        RSIZE="$2";          shift 2 ;;
-        --wsize)        WSIZE="$2";          shift 2 ;;
-        --max-credits)  MAX_CREDITS="$2";    shift 2 ;;
-        --dry-run)      DRY_RUN=true;      shift ;;
-        --no-color)     GREEN='' RED='' YELLOW='' CYAN='' BOLD='' NC=''; shift ;;
-        --version)      echo "NAS Mount Manager v$VERSION"; exit 0 ;;
-        --config)       CONFIG_FILE="$2"; source "$CONFIG_FILE" 2>/dev/null; shift 2 ;;
-        -h|--help)      usage; exit 0 ;;
-        -*)             echo -e "${RED}Unknown option: $1${NC}"; usage; exit 1 ;;
-        *)              POSITIONAL+=("$1"); shift ;;
+        -i | --ip)
+            NAS_IP="$2"
+            shift 2
+            ;;
+        --protocol)
+            PROTOCOL="$2"
+            shift 2
+            ;;
+        -u | --user)
+            NAS_USER="$2"
+            shift 2
+            ;;
+        -p | --pass)
+            NAS_PASS="$2"
+            shift 2
+            ;;
+        -m | --mount)
+            MOUNT_BASE="$2"
+            shift 2
+            ;;
+        --symlink)
+            SYMLINK_PATH="$2"
+            shift 2
+            ;;
+        --no-symlink)
+            NO_SYMLINK=true
+            shift
+            ;;
+        -s | --shares)
+            SHARES="$2"
+            shift 2
+            ;;
+        -e | --exclude)
+            EXCLUDE_SHARES="$2"
+            shift 2
+            ;;
+        --smb-version)
+            SMB_VERSION="$2"
+            shift 2
+            ;;
+        --nfs-version)
+            NFS_VERSION="$2"
+            shift 2
+            ;;
+        --nfs-nconnect)
+            NFS_NCONNECT="$2"
+            shift 2
+            ;;
+        --nfs-timeo)
+            NFS_TIMEO="$2"
+            shift 2
+            ;;
+        --nfs-retrans)
+            NFS_RETRANS="$2"
+            shift 2
+            ;;
+        --timeout | -t)
+            TIMEOUT="$2"
+            shift 2
+            ;;
+        --cache-time)
+            CACHE_TIME="$2"
+            shift 2
+            ;;
+        --rsize)
+            RSIZE="$2"
+            shift 2
+            ;;
+        --wsize)
+            WSIZE="$2"
+            shift 2
+            ;;
+        --max-credits)
+            MAX_CREDITS="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --no-color)
+            GREEN='' RED='' YELLOW='' CYAN='' BOLD='' NC=''
+            shift
+            ;;
+        --version)
+            echo "NAS Mount Manager v$VERSION"
+            exit 0
+            ;;
+        --config)
+            CONFIG_FILE="$2"
+            source "$CONFIG_FILE" 2>/dev/null
+            shift 2
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        -*)
+            echo -e "${RED}Unknown option: $1${NC}"
+            usage
+            exit 1
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
     esac
 done
 
@@ -2748,25 +2840,25 @@ COMMAND="${POSITIONAL[0]:-}"
 
 # Validate inputs
 validate_protocol
-validate_positive_int "--timeout"     "$TIMEOUT"
-validate_positive_int "--cache-time"  "$CACHE_TIME"
-validate_positive_int "--rsize"       "$RSIZE"
-validate_positive_int "--wsize"       "$WSIZE"
+validate_positive_int "--timeout" "$TIMEOUT"
+validate_positive_int "--cache-time" "$CACHE_TIME"
+validate_positive_int "--rsize" "$RSIZE"
+validate_positive_int "--wsize" "$WSIZE"
 validate_positive_int "--max-credits" "$MAX_CREDITS"
 
 case "${COMMAND:-}" in
-    mount|m)          mount_all ;;
-    remount|r)        remount_all ;;
-    unmount|umount|u) unmount_all ;;
-    repair|x)         repair_all ;;
-    status|s)         show_status ;;
-    discover|d)       discover_shares ;;
-    fstab|f)          generate_fstab ;;
-    fstab-manage|fm)  fstab_manage ;;
-    fstab-remove|fr)  fstab_remove ;;
-    fstab-edit|fe)    fstab_edit ;;
-    setup|wizard|w)   interactive_setup ;;
-    migrate)          migrate_mounts "$HOME/nas" ;;
-    config|c)         generate_config ;;
-    *)                usage ;;
+    mount | m) mount_all ;;
+    remount | r) remount_all ;;
+    unmount | umount | u) unmount_all ;;
+    repair | x) repair_all ;;
+    status | s) show_status ;;
+    discover | d) discover_shares ;;
+    fstab | f) generate_fstab ;;
+    fstab-manage | fm) fstab_manage ;;
+    fstab-remove | fr) fstab_remove ;;
+    fstab-edit | fe) fstab_edit ;;
+    setup | wizard | w) interactive_setup ;;
+    migrate) migrate_mounts "$HOME/nas" ;;
+    config | c) generate_config ;;
+    *) usage ;;
 esac
