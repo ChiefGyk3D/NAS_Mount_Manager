@@ -725,6 +725,12 @@ This Source Code Form is subject to the terms of the Mozilla Public License, v. 
 If you find NAS Mount Manager useful, consider supporting continued development.
 Everything is also collected at **[support.chiefgyk3d.com](https://support.chiefgyk3d.com)**.
 
+<div align="center">
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/A0A4E59UP)
+
+</div>
+
 ### Recurring Support
 
 <div align="center">
